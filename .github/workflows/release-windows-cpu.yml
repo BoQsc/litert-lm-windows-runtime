@@ -34,6 +34,14 @@ jobs:
       UPSTREAM_REPO: google-ai-edge/LiteRT-LM
       BAZEL_OUTPUT_BASE: C:\bzl
 
+      # Important:
+      # GitHub Windows runners can expose Android NDK paths.
+      # LiteRT-LM's own Windows CI clears ANDROID_NDK_HOME because Bazel's
+      # androidndk repository rule may try to create symlinks inside that NDK path
+      # and fail with "Cannot write outside of the repository directory".
+      ANDROID_NDK_HOME: ""
+      ANDROID_NDK_ROOT: ""
+
     steps:
       - name: Checkout this release repo
         uses: actions/checkout@v4
@@ -109,6 +117,9 @@ jobs:
       - name: Build CPU-only Windows executable
         working-directory: upstream
         run: |
+          Remove-Item Env:ANDROID_NDK_HOME -ErrorAction SilentlyContinue
+          Remove-Item Env:ANDROID_NDK_ROOT -ErrorAction SilentlyContinue
+
           bazelisk --output_base="$env:BAZEL_OUTPUT_BASE" `
             build `
             //runtime/engine:litert_lm_main `
@@ -132,35 +143,35 @@ jobs:
           }
 
           @"
-          LiteRT-LM Windows CPU Runtime
+LiteRT-LM Windows CPU Runtime
 
-          Upstream repo: https://github.com/google-ai-edge/LiteRT-LM
-          Upstream tag: $env:UPSTREAM_TAG
-          Upstream commit: $env:UPSTREAM_COMMIT
+Upstream repo: https://github.com/google-ai-edge/LiteRT-LM
+Upstream tag: $env:UPSTREAM_TAG
+Upstream commit: $env:UPSTREAM_COMMIT
 
-          This is an unofficial CPU-only native Windows x64 runtime build.
-          GPU files are intentionally not included.
+This is an unofficial CPU-only native Windows x64 runtime build.
+GPU files are intentionally not included.
 
-          Usage:
-            .\litert-lm-cpu-windows-x64.exe --backend=cpu --model_path=C:\path\to\model.litertlm
+Usage:
+  .\litert-lm-cpu-windows-x64.exe --backend=cpu --model_path=C:\path\to\model.litertlm
 
-          Notes:
-            - Models are not included.
-            - This package is intended to contain no LiteRT GPU DLLs, no DirectXShaderCompiler DLLs, and no libLiteRt.dll sidecar.
-            - The executable still uses normal Windows system/runtime DLLs provided by the OS or Visual Studio runtime.
-          "@ | Set-Content "$dist\README.txt" -Encoding UTF8
+Notes:
+  - Models are not included.
+  - This package is intended to contain no LiteRT GPU DLLs, no DirectXShaderCompiler DLLs, and no libLiteRt.dll sidecar.
+  - The executable still uses normal Windows system/runtime DLLs provided by the OS or Visual Studio runtime.
+"@ | Set-Content "$dist\README.txt" -Encoding UTF8
 
           @"
-          Source:
-          - Repository: https://github.com/google-ai-edge/LiteRT-LM
-          - Tag: $env:UPSTREAM_TAG
-          - Commit: $env:UPSTREAM_COMMIT
+Source:
+- Repository: https://github.com/google-ai-edge/LiteRT-LM
+- Tag: $env:UPSTREAM_TAG
+- Commit: $env:UPSTREAM_COMMIT
 
-          Build:
-          - Target: //runtime/engine:litert_lm_main
-          - Config: --config=windows
-          - Backend target: CPU runtime release
-          "@ | Set-Content "$dist\SOURCE.txt" -Encoding UTF8
+Build:
+- Target: //runtime/engine:litert_lm_main
+- Config: --config=windows
+- Backend target: CPU runtime release
+"@ | Set-Content "$dist\SOURCE.txt" -Encoding UTF8
 
       - name: Verify no known GPU sidecar dependency
         run: |
@@ -237,22 +248,22 @@ jobs:
           }
 
           $notes = @"
-          Unofficial LiteRT-LM native Windows x64 CPU runtime.
+Unofficial LiteRT-LM native Windows x64 CPU runtime.
 
-          Upstream:
-          - Repo: google-ai-edge/LiteRT-LM
-          - Tag: $env:UPSTREAM_TAG
-          - Commit: $env:UPSTREAM_COMMIT
+Upstream:
+- Repo: google-ai-edge/LiteRT-LM
+- Tag: $env:UPSTREAM_TAG
+- Commit: $env:UPSTREAM_COMMIT
 
-          Package:
-          - litert-lm-cpu-windows-x64.exe
-          - LICENSE-LiteRT-LM.txt
-          - README.txt
-          - SOURCE.txt
-          - DEPENDENCIES.txt
+Package:
+- litert-lm-cpu-windows-x64.exe
+- LICENSE-LiteRT-LM.txt
+- README.txt
+- SOURCE.txt
+- DEPENDENCIES.txt
 
-          This Release 1 package intentionally excludes GPU accelerator DLLs and DirectXShaderCompiler DLLs.
-          "@
+This Release 1 package intentionally excludes GPU accelerator DLLs and DirectXShaderCompiler DLLs.
+"@
 
           $notesPath = "release-notes.md"
           $notes | Set-Content $notesPath -Encoding UTF8

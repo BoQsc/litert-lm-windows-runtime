@@ -18,6 +18,9 @@ Need-Command python
 
 git config --global core.longpaths true
 
+Remove-Item Env:ANDROID_NDK_HOME -ErrorAction SilentlyContinue
+Remove-Item Env:ANDROID_NDK_ROOT -ErrorAction SilentlyContinue
+
 if (Test-Path $WorkDir) {
   Remove-Item $WorkDir -Recurse -Force
 }
