@@ -34,14 +34,6 @@ jobs:
       UPSTREAM_REPO: google-ai-edge/LiteRT-LM
       BAZEL_OUTPUT_BASE: C:\bzl
 
-      # Important:
-      # GitHub Windows runners can expose Android NDK paths.
-      # LiteRT-LM's own Windows CI clears ANDROID_NDK_HOME because Bazel's
-      # androidndk repository rule may try to create symlinks inside that NDK path
-      # and fail with "Cannot write outside of the repository directory".
-      ANDROID_NDK_HOME: ""
-      ANDROID_NDK_ROOT: ""
-
     steps:
       - name: Checkout this release repo
         uses: actions/checkout@v4
@@ -114,14 +106,38 @@ jobs:
           "UPSTREAM_COMMIT=$commit" >> $env:GITHUB_ENV
           Write-Host "LiteRT-LM commit: $commit"
 
+      - name: Normalize Android NDK path for Bazel
+        run: |
+          # LiteRT-LM v0.10.2 WORKSPACE instantiates android_ndk_repository(name = "androidndk").
+          # GitHub hosted Windows runners have NDK at C:\Android\android-sdk\ndk\<version>.
+          # Normalize to forward slashes because rules_android_ndk creates repo-relative symlinks
+          # by string replacement, and backslash paths can fail as "Cannot write outside...".
+
+          $ndkRoot = $null
+
+          if (Test-Path "C:\Android\android-sdk\ndk") {
+            $ndkRoot = Get-ChildItem "C:\Android\android-sdk\ndk" -Directory |
+              Sort-Object Name -Descending |
+              Select-Object -First 1
+          }
+
+          if (-not $ndkRoot) {
+            throw "No Android NDK found under C:\Android\android-sdk\ndk. The current LiteRT-LM WORKSPACE requires android_ndk_repository during analysis."
+          }
+
+          $ndkPath = $ndkRoot.FullName -replace '\\', '/'
+          "ANDROID_NDK_HOME=$ndkPath" >> $env:GITHUB_ENV
+
+          Write-Host "Using ANDROID_NDK_HOME=$ndkPath"
+
       - name: Build CPU-only Windows executable
         working-directory: upstream
         run: |
-          Remove-Item Env:ANDROID_NDK_HOME -ErrorAction SilentlyContinue
-          Remove-Item Env:ANDROID_NDK_ROOT -ErrorAction SilentlyContinue
+          bazelisk --output_base="$env:BAZEL_OUTPUT_BASE" shutdown
 
           bazelisk --output_base="$env:BAZEL_OUTPUT_BASE" `
             build `
+            --repo_env="ANDROID_NDK_HOME=$env:ANDROID_NDK_HOME" `
             //runtime/engine:litert_lm_main `
             --config=windows
 
@@ -154,11 +170,6 @@ GPU files are intentionally not included.
 
 Usage:
   .\litert-lm-cpu-windows-x64.exe --backend=cpu --model_path=C:\path\to\model.litertlm
-
-Notes:
-  - Models are not included.
-  - This package is intended to contain no LiteRT GPU DLLs, no DirectXShaderCompiler DLLs, and no libLiteRt.dll sidecar.
-  - The executable still uses normal Windows system/runtime DLLs provided by the OS or Visual Studio runtime.
 "@ | Set-Content "$dist\README.txt" -Encoding UTF8
 
           @"
