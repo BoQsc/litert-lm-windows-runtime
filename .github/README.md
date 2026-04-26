@@ -1,4 +1,3 @@
-
 ```
 
 C:\Users\Windows10_new\Downloads\litert-lm-single-windows-x64-v0.10.2>C:\Users\Windows10_new\Downloads\litert-lm-single-windows-x64-v0.10.2\bat.cmd
