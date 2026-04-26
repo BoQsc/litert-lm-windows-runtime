@@ -32,7 +32,6 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       UPSTREAM_REPO: google-ai-edge/LiteRT-LM
-      BAZEL_OUTPUT_BASE: C:\bzl
 
     steps:
       - name: Checkout this release repo
@@ -106,29 +105,46 @@ jobs:
           "UPSTREAM_COMMIT=$commit" >> $env:GITHUB_ENV
           Write-Host "LiteRT-LM commit: $commit"
 
-      - name: Normalize Android NDK path for Bazel
+      - name: Patch out Android NDK toolchain for Windows CPU release
+        working-directory: upstream
         run: |
-          # LiteRT-LM v0.10.2 WORKSPACE instantiates android_ndk_repository(name = "androidndk").
-          # GitHub hosted Windows runners have NDK at C:\Android\android-sdk\ndk\<version>.
-          # Normalize to forward slashes because rules_android_ndk creates repo-relative symlinks
-          # by string replacement, and backslash paths can fail as "Cannot write outside...".
+          # Release 1 is Windows CPU-only. LiteRT-LM v0.10.2's WORKSPACE conditionally
+          # registers the Android NDK toolchain when ANDROID_NDK_HOME is visible.
+          # GitHub hosted Windows runners expose C:\Android\android-sdk\ndk\<version>,
+          # and rules_android_ndk can fail while creating symlinks from that path.
+          # Force the dummy no-op Android registration for this CPU-only build.
 
-          $ndkRoot = $null
+          Remove-Item Env:ANDROID_NDK_HOME -ErrorAction SilentlyContinue
+          Remove-Item Env:ANDROID_NDK_ROOT -ErrorAction SilentlyContinue
+          Remove-Item Env:ANDROID_HOME -ErrorAction SilentlyContinue
+          Remove-Item Env:ANDROID_SDK_ROOT -ErrorAction SilentlyContinue
+          Remove-Item Env:ANDROID_SDK_HOME -ErrorAction SilentlyContinue
 
-          if (Test-Path "C:\Android\android-sdk\ndk") {
-            $ndkRoot = Get-ChildItem "C:\Android\android-sdk\ndk" -Directory |
-              Sort-Object Name -Descending |
-              Select-Object -First 1
+          $workspace = "WORKSPACE"
+          $content = Get-Content $workspace -Raw
+
+          $old = 'register_toolchains("@androidndk//:all" if ANDROID_NDK_HOME_IS_SET else "@android_ndk_env//:all")'
+          $new = 'register_toolchains("@android_ndk_env//:all")'
+
+          if (-not $content.Contains($old)) {
+            Write-Host "Expected register_toolchains line was not found. Showing nearby lines:"
+            Select-String -Path $workspace -Pattern "register_toolchains|androidndk|android_ndk_env" -Context 2,2
+            throw "Could not patch Android NDK toolchain registration."
           }
 
-          if (-not $ndkRoot) {
-            throw "No Android NDK found under C:\Android\android-sdk\ndk. The current LiteRT-LM WORKSPACE requires android_ndk_repository during analysis."
+          $content = $content.Replace($old, $new)
+          Set-Content $workspace $content -Encoding UTF8
+
+          Write-Host "Patched WORKSPACE to avoid @androidndk for Windows CPU-only build:"
+          Select-String -Path $workspace -Pattern "register_toolchains|androidndk|android_ndk_env" -Context 1,1
+
+      - name: Set Bazel output base
+        run: |
+          if ($env:GITHUB_WORKSPACE -match "^[Dd]:") {
+            "BAZEL_OUTPUT_BASE=D:/w-${{ github.run_id }}" >> $env:GITHUB_ENV
+          } else {
+            "BAZEL_OUTPUT_BASE=C:/w-${{ github.run_id }}" >> $env:GITHUB_ENV
           }
-
-          $ndkPath = $ndkRoot.FullName -replace '\\', '/'
-          "ANDROID_NDK_HOME=$ndkPath" >> $env:GITHUB_ENV
-
-          Write-Host "Using ANDROID_NDK_HOME=$ndkPath"
 
       - name: Build CPU-only Windows executable
         working-directory: upstream
@@ -137,9 +153,9 @@ jobs:
 
           bazelisk --output_base="$env:BAZEL_OUTPUT_BASE" `
             build `
-            --repo_env="ANDROID_NDK_HOME=$env:ANDROID_NDK_HOME" `
-            //runtime/engine:litert_lm_main `
-            --config=windows
+            --disk_cache=~/.cache/bazel-windows `
+            --build_tag_filters='-nowindows' `
+            //runtime/engine:litert_lm_main
 
       - name: Package runtime
         run: |
@@ -170,6 +186,11 @@ GPU files are intentionally not included.
 
 Usage:
   .\litert-lm-cpu-windows-x64.exe --backend=cpu --model_path=C:\path\to\model.litertlm
+
+Notes:
+  - Models are not included.
+  - This package is intended to contain no LiteRT GPU DLLs, no DirectXShaderCompiler DLLs, and no libLiteRt.dll sidecar.
+  - The executable may still depend on normal Windows system/runtime DLLs.
 "@ | Set-Content "$dist\README.txt" -Encoding UTF8
 
           @"
@@ -180,8 +201,8 @@ Source:
 
 Build:
 - Target: //runtime/engine:litert_lm_main
-- Config: --config=windows
-- Backend target: CPU runtime release
+- Bazel args: --build_tag_filters='-nowindows'
+- Android NDK toolchain registration patched out for Windows CPU-only release.
 "@ | Set-Content "$dist\SOURCE.txt" -Encoding UTF8
 
       - name: Verify no known GPU sidecar dependency
@@ -274,6 +295,7 @@ Package:
 - DEPENDENCIES.txt
 
 This Release 1 package intentionally excludes GPU accelerator DLLs and DirectXShaderCompiler DLLs.
+For hosted GitHub Windows builds, the workflow patches LiteRT-LM's WORKSPACE to avoid Android NDK toolchain registration because this package is Windows CPU-only.
 "@
 
           $notesPath = "release-notes.md"
