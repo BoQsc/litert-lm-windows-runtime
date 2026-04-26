@@ -132,7 +132,7 @@ jobs:
             --define=LITERT_LM_FST_CONSTRAINTS_DISABLED=1 `
             --action_env=TEMP=D:\t `
             --action_env=TMP=D:\t `
-            --jobs=2 `
+            --jobs=4 `
             //runtime/engine:litert_lm_main
 
       - name: Package single EXE
