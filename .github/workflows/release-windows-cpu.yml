@@ -20,15 +20,26 @@ jobs:
       UPSTREAM_TAG: v0.10.2
       UPSTREAM_REPO: google-ai-edge/LiteRT-LM
       GH_TOKEN: ${{ github.token }}
+
+      # Do not clear ANDROID_HOME or ANDROID_SDK_ROOT.
+      # Bazel may still instantiate @androidsdk during analysis.
+      # Clearing SDK vars made Bazel look for "platforms" inside the repo checkout.
+      #
+      # Only clear NDK-specific vars, and patch WORKSPACE so @androidndk is not registered
+      # for this Windows CPU-only release.
       ANDROID_NDK_HOME: ""
       ANDROID_NDK_ROOT: ""
-      ANDROID_HOME: ""
-      ANDROID_SDK_ROOT: ""
-      ANDROID_SDK_HOME: ""
 
     steps:
       - name: Checkout release repo
         uses: actions/checkout@v4
+
+      - name: Show Android environment
+        run: |
+          Write-Host "ANDROID_HOME=$env:ANDROID_HOME"
+          Write-Host "ANDROID_SDK_ROOT=$env:ANDROID_SDK_ROOT"
+          Write-Host "ANDROID_NDK_HOME=$env:ANDROID_NDK_HOME"
+          Write-Host "ANDROID_NDK_ROOT=$env:ANDROID_NDK_ROOT"
 
       - name: Set up Java
         uses: actions/setup-java@v4
@@ -84,11 +95,12 @@ jobs:
       - name: Patch Android NDK registration out of WORKSPACE
         working-directory: upstream
         run: |
+          # Do not remove ANDROID_HOME or ANDROID_SDK_ROOT here.
+          # Bazel may fetch android_sdk_repository during analysis.
+          # We only remove NDK vars and patch the NDK toolchain registration.
+
           Remove-Item Env:ANDROID_NDK_HOME -ErrorAction SilentlyContinue
           Remove-Item Env:ANDROID_NDK_ROOT -ErrorAction SilentlyContinue
-          Remove-Item Env:ANDROID_HOME -ErrorAction SilentlyContinue
-          Remove-Item Env:ANDROID_SDK_ROOT -ErrorAction SilentlyContinue
-          Remove-Item Env:ANDROID_SDK_HOME -ErrorAction SilentlyContinue
 
           $workspace = "WORKSPACE"
           $content = Get-Content $workspace -Raw
@@ -108,7 +120,7 @@ jobs:
 
             if ($patched -eq $content) {
               Write-Host "Android-related WORKSPACE lines:"
-              Select-String -Path $workspace -Pattern "androidndk|android_ndk_env|ANDROID_NDK_HOME|register_toolchains" -Context 2,2
+              Select-String -Path $workspace -Pattern "androidndk|android_ndk_env|ANDROID_NDK_HOME|android_sdk_repository|android_ndk_repository|register_toolchains" -Context 2,2
               throw "Could not patch Android NDK toolchain registration."
             }
 
@@ -117,7 +129,7 @@ jobs:
           }
 
           Write-Host "Final Android-related WORKSPACE lines:"
-          Select-String -Path $workspace -Pattern "androidndk|android_ndk_env|ANDROID_NDK_HOME|register_toolchains" -Context 1,1
+          Select-String -Path $workspace -Pattern "androidndk|android_ndk_env|ANDROID_NDK_HOME|android_sdk_repository|android_ndk_repository|register_toolchains" -Context 1,1
 
       - name: Build Windows CPU executable
         working-directory: upstream
