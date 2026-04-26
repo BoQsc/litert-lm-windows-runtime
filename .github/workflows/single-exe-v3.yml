@@ -1,7 +1,6 @@
 name: Build LiteRT-LM Windows Single EXE V3
 
 on:
-  push:
   workflow_dispatch:
 
 permissions:
