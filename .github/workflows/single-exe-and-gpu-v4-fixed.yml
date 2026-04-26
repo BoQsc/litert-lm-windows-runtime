@@ -1,0 +1,521 @@
+name: Build LiteRT-LM Windows CPU Single EXE and GPU ZIP V4 Fixed
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "LiteRT-LM tag to build"
+        required: true
+        default: "v0.10.2"
+      bazel_jobs:
+        description: "Bazel jobs. Use 2 for safer Windows/Rust builds."
+        required: true
+        default: "2"
+      publish_release:
+        description: "Publish GitHub Release"
+        type: boolean
+        required: true
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: litert-lm-v4-fixed
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build V4 CPU single EXE and GPU portable ZIP
+    runs-on: windows-latest
+
+    defaults:
+      run:
+        shell: pwsh
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ANDROID_NDK_HOME: ""
+      ANDROID_NDK_ROOT: ""
+
+    steps:
+      - name: WORKFLOW VERSION CHECK
+        run: |
+          Write-Host "WORKFLOW_VERSION=v4-fixed-cpu-single-and-gpu-portable"
+          Write-Host "Manual-only workflow. It does not run on every commit."
+
+      - name: Checkout release repo
+        uses: actions/checkout@v4
+
+      - name: Prepare short Windows paths
+        run: |
+          New-Item -ItemType Directory -Force D:\s | Out-Null
+          New-Item -ItemType Directory -Force D:\b_cpu | Out-Null
+          New-Item -ItemType Directory -Force D:\b_gpu | Out-Null
+          New-Item -ItemType Directory -Force D:\t | Out-Null
+
+          "SRC_DIR=D:\s" >> $env:GITHUB_ENV
+          "BAZEL_CPU_OUTPUT_BASE=D:\b_cpu" >> $env:GITHUB_ENV
+          "BAZEL_GPU_OUTPUT_BASE=D:\b_gpu" >> $env:GITHUB_ENV
+          "TEMP=D:\t" >> $env:GITHUB_ENV
+          "TMP=D:\t" >> $env:GITHUB_ENV
+
+          $env:TEMP = "D:\t"
+          $env:TMP = "D:\t"
+
+          Write-Host "SRC_DIR=D:\s"
+          Write-Host "BAZEL_CPU_OUTPUT_BASE=D:\b_cpu"
+          Write-Host "BAZEL_GPU_OUTPUT_BASE=D:\b_gpu"
+          Write-Host "TEMP=$env:TEMP"
+          Write-Host "TMP=$env:TMP"
+
+      - name: Set build variables
+        run: |
+          $tag = "${{ inputs.upstream_tag }}".Trim()
+          if (-not $tag) { $tag = "v0.10.2" }
+
+          $jobsText = "${{ inputs.bazel_jobs }}".Trim()
+          $jobs = 2
+          if ([int]::TryParse($jobsText, [ref]$jobs)) {
+            if ($jobs -lt 1) { $jobs = 1 }
+            if ($jobs -gt 8) { $jobs = 8 }
+          } else {
+            $jobs = 2
+          }
+
+          "UPSTREAM_TAG=$tag" >> $env:GITHUB_ENV
+          "BAZEL_JOBS=$jobs" >> $env:GITHUB_ENV
+
+          Write-Host "UPSTREAM_TAG=$tag"
+          Write-Host "BAZEL_JOBS=$jobs"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install Bazelisk
+        run: |
+          if (-not (Get-Command bazelisk -ErrorAction SilentlyContinue)) {
+            winget install --id=Bazel.Bazelisk -e --accept-source-agreements --accept-package-agreements --disable-interactivity
+          }
+
+          $env:Path = "$([Environment]::GetEnvironmentVariable('Path','Machine'));$([Environment]::GetEnvironmentVariable('Path','User'));$env:Path"
+          bazelisk --version
+
+      - name: Enable long paths
+        run: |
+          git config --global core.longpaths true
+          try {
+            New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force | Out-Null
+          } catch {
+            Write-Warning "Could not enable HKLM long paths. Continuing."
+          }
+
+      - name: Clone LiteRT-LM into short path
+        run: |
+          $env:TEMP = "D:\t"
+          $env:TMP = "D:\t"
+
+          if (Test-Path "D:\s\LiteRT-LM") {
+            Remove-Item "D:\s\LiteRT-LM" -Recurse -Force
+          }
+
+          git clone --depth 1 --branch "$env:UPSTREAM_TAG" https://github.com/google-ai-edge/LiteRT-LM.git "D:\s\LiteRT-LM"
+          git -C "D:\s\LiteRT-LM" lfs install
+          git -C "D:\s\LiteRT-LM" lfs pull
+
+          $commit = git -C "D:\s\LiteRT-LM" rev-parse HEAD
+          "UPSTREAM_COMMIT=$commit" >> $env:GITHUB_ENV
+
+          Write-Host "UPSTREAM_COMMIT=$commit"
+
+      - name: Patch Android NDK registration out of WORKSPACE
+        working-directory: D:\s\LiteRT-LM
+        run: |
+          $env:TEMP = "D:\t"
+          $env:TMP = "D:\t"
+
+          Remove-Item Env:ANDROID_NDK_HOME -ErrorAction SilentlyContinue
+          Remove-Item Env:ANDROID_NDK_ROOT -ErrorAction SilentlyContinue
+
+          $workspace = "WORKSPACE"
+          $content = Get-Content $workspace -Raw
+
+          $old = 'register_toolchains("@androidndk//:all" if ANDROID_NDK_HOME_IS_SET else "@android_ndk_env//:all")'
+          $new = 'register_toolchains("@android_ndk_env//:all")'
+
+          if ($content.Contains($old)) {
+            $content = $content.Replace($old, $new)
+            Set-Content $workspace $content -Encoding UTF8
+            Write-Host "Patched Android NDK toolchain registration."
+          } else {
+            $pattern = 'register_toolchains\("@androidndk//:all"\s+if\s+ANDROID_NDK_HOME_IS_SET\s+else\s+"@android_ndk_env//:all"\)'
+            $patched = [regex]::Replace($content, $pattern, $new)
+            if ($patched -eq $content) {
+              Select-String -Path $workspace -Pattern "androidndk|android_ndk_env|ANDROID_NDK_HOME|register_toolchains" -Context 2,2
+              throw "Could not patch Android NDK toolchain registration."
+            }
+            Set-Content $workspace $patched -Encoding UTF8
+            Write-Host "Patched Android NDK toolchain registration with regex fallback."
+          }
+
+      - name: Build CPU single EXE with FST constraints disabled
+        working-directory: D:\s\LiteRT-LM
+        run: |
+          $env:TEMP = "D:\t"
+          $env:TMP = "D:\t"
+
+          Write-Host "Building CPU single EXE"
+          Write-Host "BAZEL_CPU_OUTPUT_BASE=$env:BAZEL_CPU_OUTPUT_BASE"
+          Write-Host "BAZEL_JOBS=$env:BAZEL_JOBS"
+
+          bazelisk --output_base="$env:BAZEL_CPU_OUTPUT_BASE" shutdown
+
+          bazelisk --output_base="$env:BAZEL_CPU_OUTPUT_BASE" `
+            build `
+            --build_tag_filters='-nowindows' `
+            --define=LITERT_LM_FST_CONSTRAINTS_DISABLED=1 `
+            --action_env=TEMP=D:\t `
+            --action_env=TMP=D:\t `
+            --jobs="$env:BAZEL_JOBS" `
+            //runtime/engine:litert_lm_main
+
+      - name: Package CPU single EXE
+        run: |
+          $dist = "$env:GITHUB_WORKSPACE\dist-cpu"
+          if (Test-Path $dist) { Remove-Item $dist -Recurse -Force }
+          New-Item -ItemType Directory -Force $dist | Out-Null
+
+          $exeSource = "D:\s\LiteRT-LM\bazel-bin\runtime\engine\litert_lm_main.exe"
+          if (-not (Test-Path $exeSource)) { throw "Expected CPU executable not found: $exeSource" }
+
+          Copy-Item $exeSource "$dist\litert-lm-single-windows-x64.exe" -Force
+          Copy-Item "D:\s\LiteRT-LM\LICENSE" "$dist\LICENSE-LiteRT-LM.txt" -Force
+          if (Test-Path "D:\s\LiteRT-LM\NOTICE") { Copy-Item "D:\s\LiteRT-LM\NOTICE" "$dist\NOTICE-LiteRT-LM.txt" -Force }
+
+          $version = @(
+            "package=cpu-single-exe",
+            "workflow=v4-fixed-cpu-single-and-gpu-portable",
+            "upstream_tag=$env:UPSTREAM_TAG",
+            "upstream_commit=$env:UPSTREAM_COMMIT",
+            "bazel_jobs=$env:BAZEL_JOBS",
+            "fst_constraints_disabled=1"
+          )
+          $version | Set-Content "$dist\VERSION.txt" -Encoding UTF8
+
+          $readme = @(
+            "LiteRT-LM Windows CPU Single EXE",
+            "",
+            "Workflow version: v4-fixed-cpu-single-and-gpu-portable",
+            "Upstream repo: https://github.com/google-ai-edge/LiteRT-LM",
+            "Upstream tag: $env:UPSTREAM_TAG",
+            "Upstream commit: $env:UPSTREAM_COMMIT",
+            "",
+            "Usage:",
+            '  .\litert-lm-single-windows-x64.exe --backend=cpu --model_path=C:\path\to\model.litertlm --input_prompt="Hello"',
+            "",
+            "Important:",
+            "  - Built with --define=LITERT_LM_FST_CONSTRAINTS_DISABLED=1.",
+            "  - This removes the GemmaModelConstraintProvider sidecar DLL dependency.",
+            "  - FST constrained decoding / constrained tool-call decoding is disabled.",
+            "  - Models are not included.",
+            "  - The EXE may still depend on normal Windows/MSVC runtime DLLs."
+          )
+          $readme | Set-Content "$dist\README.txt" -Encoding UTF8
+
+          $sample = @(
+            '@echo off',
+            'cd /d "%~dp0"',
+            'if "%~1"=="" (',
+            '  echo Usage: run-example.cmd C:\path\to\model.litertlm',
+            '  pause',
+            '  exit /b 1',
+            ')',
+            'litert-lm-single-windows-x64.exe --backend=cpu --model_path="%~1" --input_prompt="Hello. Write one short paragraph."',
+            'pause'
+          )
+          $sample | Set-Content "$dist\run-example.cmd" -Encoding ASCII
+
+          $source = @(
+            "Source:",
+            "- Repository: https://github.com/google-ai-edge/LiteRT-LM",
+            "- Tag: $env:UPSTREAM_TAG",
+            "- Commit: $env:UPSTREAM_COMMIT",
+            "",
+            "Build:",
+            "- Package: CPU single EXE",
+            "- Target: //runtime/engine:litert_lm_main",
+            "- Bazel filter: --build_tag_filters='-nowindows'",
+            "- Single-EXE flag: --define=LITERT_LM_FST_CONSTRAINTS_DISABLED=1",
+            "- Short source path: D:\s\LiteRT-LM",
+            "- Short Bazel output base: D:\b_cpu",
+            "- Short temp path: D:\t",
+            "- Jobs: $env:BAZEL_JOBS"
+          )
+          $source | Set-Content "$dist\SOURCE.txt" -Encoding UTF8
+
+      - name: Verify CPU package has no known LiteRT-LM sidecar DLL dependency
+        run: |
+          $exe = "$env:GITHUB_WORKSPACE\dist-cpu\litert-lm-single-windows-x64.exe"
+          $depsFile = "$env:GITHUB_WORKSPACE\dist-cpu\DEPENDENCIES.txt"
+
+          $dumpbin = Get-ChildItem "${env:ProgramFiles}\Microsoft Visual Studio\2022" -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match "Hostx64\\x64" } |
+            Select-Object -First 1 -ExpandProperty FullName
+
+          if (-not $dumpbin) {
+            "dumpbin.exe not found; dependency inspection skipped." | Set-Content $depsFile -Encoding UTF8
+            Write-Warning "dumpbin.exe not found. Cannot prove sidecar dependency status."
+            exit 0
+          }
+
+          & $dumpbin /DEPENDENTS $exe | Tee-Object -FilePath $depsFile
+
+          $content = Get-Content $depsFile -Raw
+          $forbidden = @(
+            "libGemmaModelConstraintProvider.dll",
+            "libLiteRt.dll",
+            "libLiteRtWebGpuAccelerator.dll",
+            "libLiteRtGpuAccelerator.dll",
+            "libLiteRtTopKWebGpuSampler.dll",
+            "dxcompiler.dll",
+            "dxil.dll"
+          )
+
+          $found = @()
+          foreach ($name in $forbidden) {
+            if ($content -match [regex]::Escape($name)) { $found += $name }
+          }
+
+          if ($found.Count -gt 0) {
+            throw "CPU package is not a single LiteRT-LM EXE yet. Found sidecar DLL dependency: $($found -join ', ')"
+          }
+
+          Write-Host "No known LiteRT-LM sidecar DLL dependencies found in CPU package."
+
+      - name: Build full portable EXE for GPU ZIP
+        working-directory: D:\s\LiteRT-LM
+        run: |
+          $env:TEMP = "D:\t"
+          $env:TMP = "D:\t"
+
+          Write-Host "Building full portable EXE for GPU ZIP"
+          Write-Host "BAZEL_GPU_OUTPUT_BASE=$env:BAZEL_GPU_OUTPUT_BASE"
+          Write-Host "BAZEL_JOBS=$env:BAZEL_JOBS"
+
+          bazelisk --output_base="$env:BAZEL_GPU_OUTPUT_BASE" shutdown
+
+          bazelisk --output_base="$env:BAZEL_GPU_OUTPUT_BASE" `
+            build `
+            --build_tag_filters='-nowindows' `
+            --action_env=TEMP=D:\t `
+            --action_env=TMP=D:\t `
+            --jobs="$env:BAZEL_JOBS" `
+            //runtime/engine:litert_lm_main
+
+      - name: Package GPU portable ZIP folder
+        run: |
+          $dist = "$env:GITHUB_WORKSPACE\dist-gpu"
+          if (Test-Path $dist) { Remove-Item $dist -Recurse -Force }
+          New-Item -ItemType Directory -Force $dist | Out-Null
+
+          $exeSource = "D:\s\LiteRT-LM\bazel-bin\runtime\engine\litert_lm_main.exe"
+          if (-not (Test-Path $exeSource)) { throw "Expected full portable executable not found: $exeSource" }
+
+          Copy-Item $exeSource "$dist\litert-lm-portable-windows-x64.exe" -Force
+          Copy-Item "D:\s\LiteRT-LM\LICENSE" "$dist\LICENSE-LiteRT-LM.txt" -Force
+          if (Test-Path "D:\s\LiteRT-LM\NOTICE") { Copy-Item "D:\s\LiteRT-LM\NOTICE" "$dist\NOTICE-LiteRT-LM.txt" -Force }
+
+          $prebuilt = "D:\s\LiteRT-LM\prebuilt\windows_x86_64"
+          if (-not (Test-Path $prebuilt)) { throw "Missing prebuilt Windows DLL folder: $prebuilt" }
+
+          Get-ChildItem $prebuilt -Filter "*.dll" -File | ForEach-Object {
+            Copy-Item $_.FullName "$dist\$($_.Name)" -Force
+          }
+
+          $version = @(
+            "package=gpu-portable-zip",
+            "workflow=v4-fixed-cpu-single-and-gpu-portable",
+            "upstream_tag=$env:UPSTREAM_TAG",
+            "upstream_commit=$env:UPSTREAM_COMMIT",
+            "bazel_jobs=$env:BAZEL_JOBS",
+            "fst_constraints_disabled=0",
+            "prebuilt_dlls=1"
+          )
+          $version | Set-Content "$dist\VERSION.txt" -Encoding UTF8
+
+          $readme = @(
+            "LiteRT-LM Windows GPU Portable ZIP",
+            "",
+            "Workflow version: v4-fixed-cpu-single-and-gpu-portable",
+            "Upstream repo: https://github.com/google-ai-edge/LiteRT-LM",
+            "Upstream tag: $env:UPSTREAM_TAG",
+            "Upstream commit: $env:UPSTREAM_COMMIT",
+            "",
+            "Usage CPU:",
+            '  .\litert-lm-portable-windows-x64.exe --backend=cpu --model_path=C:\path\to\model.litertlm --input_prompt="Hello"',
+            "",
+            "Usage GPU attempt:",
+            '  .\litert-lm-portable-windows-x64.exe --backend=gpu --model_path=C:\path\to\model.litertlm --input_prompt="Hello"',
+            "",
+            "Important:",
+            "  - Keep all DLL files beside the EXE.",
+            "  - Do not move only the EXE to another folder.",
+            "  - This package includes upstream prebuilt Windows DLLs.",
+            "  - This is not a true single-EXE package.",
+            "  - Models are not included."
+          )
+          $readme | Set-Content "$dist\README.txt" -Encoding UTF8
+
+          $sampleCpu = @(
+            '@echo off',
+            'cd /d "%~dp0"',
+            'if "%~1"=="" (',
+            '  echo Usage: run-cpu-example.cmd C:\path\to\model.litertlm',
+            '  pause',
+            '  exit /b 1',
+            ')',
+            'litert-lm-portable-windows-x64.exe --backend=cpu --model_path="%~1" --input_prompt="Hello. Write one short paragraph."',
+            'pause'
+          )
+          $sampleCpu | Set-Content "$dist\run-cpu-example.cmd" -Encoding ASCII
+
+          $sampleGpu = @(
+            '@echo off',
+            'cd /d "%~dp0"',
+            'if "%~1"=="" (',
+            '  echo Usage: run-gpu-example.cmd C:\path\to\model.litertlm',
+            '  pause',
+            '  exit /b 1',
+            ')',
+            'litert-lm-portable-windows-x64.exe --backend=gpu --model_path="%~1" --input_prompt="Hello. Write one short paragraph."',
+            'pause'
+          )
+          $sampleGpu | Set-Content "$dist\run-gpu-example.cmd" -Encoding ASCII
+
+          $source = @(
+            "Source:",
+            "- Repository: https://github.com/google-ai-edge/LiteRT-LM",
+            "- Tag: $env:UPSTREAM_TAG",
+            "- Commit: $env:UPSTREAM_COMMIT",
+            "",
+            "Build:",
+            "- Package: GPU portable ZIP",
+            "- Target: //runtime/engine:litert_lm_main",
+            "- Bazel filter: --build_tag_filters='-nowindows'",
+            "- FST disabled: no",
+            "- Short source path: D:\s\LiteRT-LM",
+            "- Short Bazel output base: D:\b_gpu",
+            "- Short temp path: D:\t",
+            "- Jobs: $env:BAZEL_JOBS",
+            "",
+            "Runtime DLLs:",
+            "- Copied from D:\s\LiteRT-LM\prebuilt\windows_x86_64\*.dll"
+          )
+          $source | Set-Content "$dist\SOURCE.txt" -Encoding UTF8
+
+          Write-Host "GPU portable package files:"
+          Get-ChildItem $dist | Sort-Object Name | ForEach-Object { Write-Host "  $($_.Name)" }
+
+      - name: Inspect GPU portable dependencies
+        run: |
+          $exe = "$env:GITHUB_WORKSPACE\dist-gpu\litert-lm-portable-windows-x64.exe"
+          $depsFile = "$env:GITHUB_WORKSPACE\dist-gpu\DEPENDENCIES.txt"
+
+          $dumpbin = Get-ChildItem "${env:ProgramFiles}\Microsoft Visual Studio\2022" -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match "Hostx64\\x64" } |
+            Select-Object -First 1 -ExpandProperty FullName
+
+          if ($dumpbin) {
+            & $dumpbin /DEPENDENTS $exe | Tee-Object -FilePath $depsFile
+          } else {
+            "dumpbin.exe not found; dependency inspection skipped." | Set-Content $depsFile -Encoding UTF8
+          }
+
+      - name: Generate SHA256 checksums
+        run: |
+          foreach ($dir in @("dist-cpu", "dist-gpu")) {
+            $path = "$env:GITHUB_WORKSPACE\$dir"
+            Get-ChildItem $path -File | ForEach-Object {
+              $hash = Get-FileHash $_.FullName -Algorithm SHA256
+              "$($hash.Hash)  $($_.Name)"
+            } | Set-Content "$path\SHA256SUMS.txt" -Encoding ASCII
+
+            Write-Host "$dir checksums:"
+            Get-Content "$path\SHA256SUMS.txt"
+          }
+
+      - name: Create zips
+        id: zip
+        run: |
+          $cpuZip = "$env:GITHUB_WORKSPACE\litert-lm-cpu-single-windows-x64-$env:UPSTREAM_TAG-v4-fixed.zip"
+          $gpuZip = "$env:GITHUB_WORKSPACE\litert-lm-gpu-portable-windows-x64-$env:UPSTREAM_TAG-v4-fixed.zip"
+
+          if (Test-Path $cpuZip) { Remove-Item $cpuZip -Force }
+          if (Test-Path $gpuZip) { Remove-Item $gpuZip -Force }
+
+          Compress-Archive -Path "$env:GITHUB_WORKSPACE\dist-cpu\*" -DestinationPath $cpuZip -Force
+          Compress-Archive -Path "$env:GITHUB_WORKSPACE\dist-gpu\*" -DestinationPath $gpuZip -Force
+
+          "cpu_zip=$cpuZip" >> $env:GITHUB_OUTPUT
+          "gpu_zip=$gpuZip" >> $env:GITHUB_OUTPUT
+
+          Write-Host "Created $cpuZip"
+          Write-Host "Created $gpuZip"
+
+      - name: Upload CPU single EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: litert-lm-cpu-single-windows-x64-v4-fixed
+          path: ${{ steps.zip.outputs.cpu_zip }}
+
+      - name: Upload GPU portable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: litert-lm-gpu-portable-windows-x64-v4-fixed
+          path: ${{ steps.zip.outputs.gpu_zip }}
+
+      - name: Publish GitHub release
+        if: ${{ inputs.publish_release }}
+        run: |
+          $releaseTag = "litert-lm-windows-x64-$env:UPSTREAM_TAG-v4-fixed"
+
+          $notes = @(
+            "Unofficial LiteRT-LM native Windows x64 release.",
+            "",
+            "Workflow version: v4-fixed-cpu-single-and-gpu-portable",
+            "Manual-only workflow; it does not run on push.",
+            "",
+            "Artifacts:",
+            "- CPU single EXE ZIP: built with --define=LITERT_LM_FST_CONSTRAINTS_DISABLED=1",
+            "- GPU portable ZIP: EXE plus upstream prebuilt Windows DLLs",
+            "",
+            "CPU single EXE tradeoff:",
+            "- Removes GemmaModelConstraintProvider DLL dependency",
+            "- Disables FST constrained decoding / constrained tool-call decoding",
+            "",
+            "Upstream:",
+            "- Repo: google-ai-edge/LiteRT-LM",
+            "- Tag: $env:UPSTREAM_TAG",
+            "- Commit: $env:UPSTREAM_COMMIT"
+          )
+
+          $notesPath = "$env:GITHUB_WORKSPACE\release-notes.md"
+          $notes | Set-Content $notesPath -Encoding UTF8
+
+          $cpuZip = "${{ steps.zip.outputs.cpu_zip }}"
+          $gpuZip = "${{ steps.zip.outputs.gpu_zip }}"
+
+          gh release view $releaseTag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $releaseTag $cpuZip $gpuZip --clobber
+          } else {
+            gh release create $releaseTag $cpuZip $gpuZip --title "LiteRT-LM Windows x64 $env:UPSTREAM_TAG V4 Fixed" --notes-file $notesPath
+          }
