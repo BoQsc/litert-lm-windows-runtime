@@ -1,14 +1,19 @@
 name: Release LiteRT-LM Windows CPU Single EXE
 
 on:
+  push:
+    branches:
+      - main
+      - master
+
   workflow_dispatch:
     inputs:
       upstream_tag:
-        description: "LiteRT-LM tag to build, for example v0.10.2. Use latest for latest GitHub release."
+        description: "LiteRT-LM tag to build. Use v0.10.2 first."
         required: true
         default: "v0.10.2"
       release_tag:
-        description: "Output release tag in this repo. Leave empty for litert-lm-cpu-windows-x64-<upstream_tag>."
+        description: "Output release tag. Leave empty for litert-lm-cpu-windows-x64-<upstream_tag>."
         required: false
         default: ""
       prerelease:
@@ -19,6 +24,10 @@ on:
 
 permissions:
   contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -32,6 +41,16 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       UPSTREAM_REPO: google-ai-edge/LiteRT-LM
+
+      # Important for GitHub-hosted Windows runners.
+      # They expose Android SDK/NDK paths. LiteRT-LM v0.10.2's WORKSPACE
+      # declares Android NDK rules even for this Windows build, so we patch
+      # WORKSPACE after clone to avoid fetching/registering @androidndk.
+      ANDROID_NDK_HOME: ""
+      ANDROID_NDK_ROOT: ""
+      ANDROID_HOME: ""
+      ANDROID_SDK_ROOT: ""
+      ANDROID_SDK_HOME: ""
 
     steps:
       - name: Checkout this release repo
@@ -80,6 +99,10 @@ jobs:
         run: |
           $requested = "${{ inputs.upstream_tag }}".Trim()
 
+          if (-not $requested) {
+            $requested = "v0.10.2"
+          }
+
           if ($requested -eq "latest") {
             $tag = gh release view --repo $env:UPSTREAM_REPO --json tagName --jq ".tagName"
           } else {
@@ -105,15 +128,9 @@ jobs:
           "UPSTREAM_COMMIT=$commit" >> $env:GITHUB_ENV
           Write-Host "LiteRT-LM commit: $commit"
 
-      - name: Patch out Android NDK toolchain for Windows CPU release
+      - name: Patch out Android NDK toolchain for Windows CPU-only build
         working-directory: upstream
         run: |
-          # Release 1 is Windows CPU-only. LiteRT-LM v0.10.2's WORKSPACE conditionally
-          # registers the Android NDK toolchain when ANDROID_NDK_HOME is visible.
-          # GitHub hosted Windows runners expose C:\Android\android-sdk\ndk\<version>,
-          # and rules_android_ndk can fail while creating symlinks from that path.
-          # Force the dummy no-op Android registration for this CPU-only build.
-
           Remove-Item Env:ANDROID_NDK_HOME -ErrorAction SilentlyContinue
           Remove-Item Env:ANDROID_NDK_ROOT -ErrorAction SilentlyContinue
           Remove-Item Env:ANDROID_HOME -ErrorAction SilentlyContinue
@@ -127,24 +144,23 @@ jobs:
           $new = 'register_toolchains("@android_ndk_env//:all")'
 
           if (-not $content.Contains($old)) {
-            Write-Host "Expected register_toolchains line was not found. Showing nearby lines:"
-            Select-String -Path $workspace -Pattern "register_toolchains|androidndk|android_ndk_env" -Context 2,2
+            Write-Host "Expected Android toolchain registration line was not found."
+            Write-Host "Showing Android-related WORKSPACE lines:"
+            Select-String -Path $workspace -Pattern "androidndk|android_ndk_env|register_toolchains" -Context 2,2
             throw "Could not patch Android NDK toolchain registration."
           }
 
           $content = $content.Replace($old, $new)
           Set-Content $workspace $content -Encoding UTF8
 
-          Write-Host "Patched WORKSPACE to avoid @androidndk for Windows CPU-only build:"
-          Select-String -Path $workspace -Pattern "register_toolchains|androidndk|android_ndk_env" -Context 1,1
+          Write-Host "Patched WORKSPACE. Android-related lines are now:"
+          Select-String -Path $workspace -Pattern "androidndk|android_ndk_env|register_toolchains" -Context 2,2
 
       - name: Set Bazel output base
         run: |
-          if ($env:GITHUB_WORKSPACE -match "^[Dd]:") {
-            "BAZEL_OUTPUT_BASE=D:/w-${{ github.run_id }}" >> $env:GITHUB_ENV
-          } else {
-            "BAZEL_OUTPUT_BASE=C:/w-${{ github.run_id }}" >> $env:GITHUB_ENV
-          }
+          $shortSha = "${{ github.sha }}".Substring(0, 8)
+          "BAZEL_OUTPUT_BASE=D:/w-$shortSha" >> $env:GITHUB_ENV
+          Write-Host "BAZEL_OUTPUT_BASE=D:/w-$shortSha"
 
       - name: Build CPU-only Windows executable
         working-directory: upstream
@@ -202,7 +218,7 @@ Source:
 Build:
 - Target: //runtime/engine:litert_lm_main
 - Bazel args: --build_tag_filters='-nowindows'
-- Android NDK toolchain registration patched out for Windows CPU-only release.
+- Android NDK toolchain registration patched out for this Windows CPU-only release.
 "@ | Set-Content "$dist\SOURCE.txt" -Encoding UTF8
 
       - name: Verify no known GPU sidecar dependency
@@ -295,7 +311,7 @@ Package:
 - DEPENDENCIES.txt
 
 This Release 1 package intentionally excludes GPU accelerator DLLs and DirectXShaderCompiler DLLs.
-For hosted GitHub Windows builds, the workflow patches LiteRT-LM's WORKSPACE to avoid Android NDK toolchain registration because this package is Windows CPU-only.
+For GitHub hosted Windows builds, this workflow patches LiteRT-LM's WORKSPACE to avoid Android NDK toolchain registration because this package is Windows CPU-only.
 "@
 
           $notesPath = "release-notes.md"
