@@ -1,4 +1,4 @@
-name: Build LiteRT-LM Windows Runtime
+name: Build LiteRT-LM Windows Single EXE
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   build:
-    name: Build Windows x64 runtime
+    name: Build Windows x64 single EXE attempt
     runs-on: windows-latest
 
     defaults:
@@ -42,12 +42,14 @@ jobs:
           if (-not (Get-Command bazelisk -ErrorAction SilentlyContinue)) {
             winget install --id=Bazel.Bazelisk -e --accept-source-agreements --accept-package-agreements --disable-interactivity
           }
+
           $env:Path = "$([Environment]::GetEnvironmentVariable('Path','Machine'));$([Environment]::GetEnvironmentVariable('Path','User'));$env:Path"
           bazelisk --version
 
       - name: Enable long paths
         run: |
           git config --global core.longpaths true
+
           try {
             New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force | Out-Null
           } catch {
@@ -59,8 +61,12 @@ jobs:
           git clone --depth 1 --branch "$env:UPSTREAM_TAG" https://github.com/google-ai-edge/LiteRT-LM.git upstream
           git -C upstream lfs install
           git -C upstream lfs pull
+
           $commit = git -C upstream rev-parse HEAD
           "UPSTREAM_COMMIT=$commit" >> $env:GITHUB_ENV
+
+          Write-Host "LiteRT-LM tag: $env:UPSTREAM_TAG"
+          Write-Host "LiteRT-LM commit: $commit"
 
       - name: Patch Android NDK registration out of WORKSPACE
         working-directory: upstream
@@ -77,59 +83,66 @@ jobs:
           if ($content.Contains($old)) {
             $content = $content.Replace($old, $new)
             Set-Content $workspace $content -Encoding UTF8
+            Write-Host "Patched Android NDK toolchain registration."
           } else {
             $pattern = 'register_toolchains\("@androidndk//:all"\s+if\s+ANDROID_NDK_HOME_IS_SET\s+else\s+"@android_ndk_env//:all"\)'
             $patched = [regex]::Replace($content, $pattern, $new)
+
             if ($patched -eq $content) {
               Select-String -Path $workspace -Pattern "androidndk|android_ndk_env|ANDROID_NDK_HOME|register_toolchains" -Context 2,2
               throw "Could not patch Android NDK toolchain registration."
             }
+
             Set-Content $workspace $patched -Encoding UTF8
+            Write-Host "Patched Android NDK toolchain registration with regex fallback."
           }
 
-      - name: Build Windows executable
+      - name: Build Windows single EXE attempt
         working-directory: upstream
         run: |
           $shortSha = "${{ github.sha }}".Substring(0, 8)
-          $outputBase = "D:/bzl-$shortSha"
-          bazelisk --output_base="$outputBase" shutdown
-          bazelisk --output_base="$outputBase" build --build_tag_filters='-nowindows' //runtime/engine:litert_lm_main
+          $outputBase = "D:/bzl-single-$shortSha"
 
-      - name: Package runtime with required DLLs
+          bazelisk --output_base="$outputBase" shutdown
+
+          bazelisk --output_base="$outputBase" `
+            build `
+            --build_tag_filters='-nowindows' `
+            --define=LITERT_LM_FST_CONSTRAINTS_DISABLED=1 `
+            //runtime/engine:litert_lm_main
+
+      - name: Package single EXE
         run: |
           $dist = "dist"
           New-Item -ItemType Directory -Force $dist | Out-Null
 
-          Copy-Item "upstream\bazel-bin\runtime\engine\litert_lm_main.exe" "$dist\litert-lm-cpu-windows-x64.exe" -Force
+          $exeSource = "upstream\bazel-bin\runtime\engine\litert_lm_main.exe"
+          if (-not (Test-Path $exeSource)) {
+            throw "Expected executable not found: $exeSource"
+          }
+
+          Copy-Item $exeSource "$dist\litert-lm-single-windows-x64.exe" -Force
           Copy-Item "upstream\LICENSE" "$dist\LICENSE-LiteRT-LM.txt" -Force
 
           if (Test-Path "upstream\NOTICE") {
             Copy-Item "upstream\NOTICE" "$dist\NOTICE-LiteRT-LM.txt" -Force
           }
 
-          if (-not (Test-Path "upstream\prebuilt\windows_x86_64\libGemmaModelConstraintProvider.dll")) {
-            throw "Missing libGemmaModelConstraintProvider.dll in upstream prebuilt/windows_x86_64"
-          }
-
-          Get-ChildItem "upstream\prebuilt\windows_x86_64" -Filter "*.dll" -File | ForEach-Object {
-            Copy-Item $_.FullName "$dist\$($_.Name)" -Force
-          }
-
           $readme = @(
-            "LiteRT-LM Windows Runtime",
+            "LiteRT-LM Windows Single EXE Attempt",
             "",
             "Upstream repo: https://github.com/google-ai-edge/LiteRT-LM",
             "Upstream tag: $env:UPSTREAM_TAG",
             "Upstream commit: $env:UPSTREAM_COMMIT",
             "",
             "Usage:",
-            "  .\litert-lm-cpu-windows-x64.exe --backend=cpu --model_path=C:\path\to\model.litertlm",
+            "  .\litert-lm-single-windows-x64.exe --backend=cpu --model_path=C:\path\to\model.litertlm",
             "",
             "Important:",
-            "  - Keep all DLL files beside the EXE.",
-            "  - Do not move only the EXE to another folder.",
-            "  - libGemmaModelConstraintProvider.dll is required at process startup.",
-            "  - This is a portable folder release, not a true single-EXE release yet."
+            "  - Built with --define=LITERT_LM_FST_CONSTRAINTS_DISABLED=1.",
+            "  - This removes the GemmaModelConstraintProvider prebuilt DLL dependency.",
+            "  - FST constrained decoding / constrained tool-call decoding is disabled.",
+            "  - Models are not included."
           )
           $readme | Set-Content "$dist\README.txt" -Encoding UTF8
 
@@ -139,59 +152,98 @@ jobs:
             "- Tag: $env:UPSTREAM_TAG",
             "- Commit: $env:UPSTREAM_COMMIT",
             "",
-            "Runtime DLLs copied from:",
-            "- upstream/prebuilt/windows_x86_64/*.dll"
+            "Build:",
+            "- Target: //runtime/engine:litert_lm_main",
+            "- Bazel filter: --build_tag_filters='-nowindows'",
+            "- Single-EXE flag: --define=LITERT_LM_FST_CONSTRAINTS_DISABLED=1",
+            "- Android NDK toolchain registration patched out for Windows CPU-only build."
           )
           $source | Set-Content "$dist\SOURCE.txt" -Encoding UTF8
 
-          Get-ChildItem $dist | Sort-Object Name | ForEach-Object { Write-Host $_.Name }
-
-      - name: Inspect dependencies
+      - name: Verify no LiteRT-LM sidecar DLL dependency
         run: |
-          $exe = "dist\litert-lm-cpu-windows-x64.exe"
+          $exe = "dist\litert-lm-single-windows-x64.exe"
           $depsFile = "dist\DEPENDENCIES.txt"
 
           $dumpbin = Get-ChildItem "${env:ProgramFiles}\Microsoft Visual Studio\2022" -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue |
             Where-Object { $_.FullName -match "Hostx64\\x64" } |
             Select-Object -First 1 -ExpandProperty FullName
 
-          if ($dumpbin) {
-            & $dumpbin /DEPENDENTS $exe | Tee-Object -FilePath $depsFile
-          } else {
+          if (-not $dumpbin) {
             "dumpbin.exe not found; dependency inspection skipped." | Set-Content $depsFile -Encoding UTF8
+            Write-Warning "dumpbin.exe not found. Cannot prove sidecar dependency status."
+            exit 0
           }
+
+          & $dumpbin /DEPENDENTS $exe | Tee-Object -FilePath $depsFile
+
+          $content = Get-Content $depsFile -Raw
+
+          $forbidden = @(
+            "libGemmaModelConstraintProvider.dll",
+            "libLiteRt.dll",
+            "libLiteRtWebGpuAccelerator.dll",
+            "libLiteRtGpuAccelerator.dll",
+            "libLiteRtTopKWebGpuSampler.dll",
+            "dxcompiler.dll",
+            "dxil.dll"
+          )
+
+          $found = @()
+          foreach ($name in $forbidden) {
+            if ($content -match [regex]::Escape($name)) {
+              $found += $name
+            }
+          }
+
+          if ($found.Count -gt 0) {
+            throw "Not a single LiteRT-LM EXE yet. Found sidecar DLL dependency: $($found -join ', ')"
+          }
+
+          Write-Host "No known LiteRT-LM sidecar DLL dependencies found."
 
       - name: Create zip
         id: zip
         run: |
-          $zip = "litert-lm-windows-x64-portable-$env:UPSTREAM_TAG.zip"
-          if (Test-Path $zip) { Remove-Item $zip -Force }
+          $zip = "litert-lm-single-windows-x64-$env:UPSTREAM_TAG.zip"
+          if (Test-Path $zip) {
+            Remove-Item $zip -Force
+          }
+
           Compress-Archive -Path "dist\*" -DestinationPath $zip -Force
           "zip=$zip" >> $env:GITHUB_OUTPUT
+          Write-Host "Created $zip"
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: litert-lm-windows-x64-portable
+          name: litert-lm-single-windows-x64
           path: ${{ steps.zip.outputs.zip }}
 
       - name: Publish GitHub release
         run: |
-          $releaseTag = "litert-lm-windows-x64-portable-$env:UPSTREAM_TAG"
+          $releaseTag = "litert-lm-single-windows-x64-$env:UPSTREAM_TAG"
+
           $notes = @(
-            "Unofficial LiteRT-LM native Windows x64 portable runtime.",
+            "Unofficial LiteRT-LM native Windows x64 single-EXE attempt.",
             "",
-            "Keep all DLL files beside the EXE.",
-            "This is not a true single-EXE package yet.",
+            "Built with --define=LITERT_LM_FST_CONSTRAINTS_DISABLED=1 to remove the GemmaModelConstraintProvider DLL dependency.",
+            "This disables FST constrained decoding / constrained tool-call decoding.",
             "",
-            "Upstream: google-ai-edge/LiteRT-LM $env:UPSTREAM_TAG / $env:UPSTREAM_COMMIT"
+            "Upstream:",
+            "- Repo: google-ai-edge/LiteRT-LM",
+            "- Tag: $env:UPSTREAM_TAG",
+            "- Commit: $env:UPSTREAM_COMMIT"
           )
+
           $notesPath = "release-notes.md"
           $notes | Set-Content $notesPath -Encoding UTF8
+
           $zip = "${{ steps.zip.outputs.zip }}"
+
           gh release view $releaseTag *> $null
           if ($LASTEXITCODE -eq 0) {
             gh release upload $releaseTag $zip --clobber
           } else {
-            gh release create $releaseTag $zip --title "LiteRT-LM Windows x64 portable runtime $env:UPSTREAM_TAG" --notes-file $notesPath
+            gh release create $releaseTag $zip --title "LiteRT-LM Windows x64 single EXE $env:UPSTREAM_TAG" --notes-file $notesPath
           }
