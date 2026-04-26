@@ -1,18 +1,290 @@
-name: Sanity Workflow Test
+name: Build LiteRT-LM Windows CPU Runtime
 
 on:
   push:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
-  test:
+  build:
+    name: Build Windows x64 CPU EXE
     runs-on: windows-latest
 
-    steps:
-      - name: Say workflow is running
+    defaults:
+      run:
         shell: pwsh
+
+    env:
+      UPSTREAM_TAG: v0.10.2
+      UPSTREAM_REPO: google-ai-edge/LiteRT-LM
+      GH_TOKEN: ${{ github.token }}
+
+      # Keep Android invisible for this Windows CPU-only build.
+      ANDROID_NDK_HOME: ""
+      ANDROID_NDK_ROOT: ""
+      ANDROID_HOME: ""
+      ANDROID_SDK_ROOT: ""
+      ANDROID_SDK_HOME: ""
+
+    steps:
+      - name: Checkout release repo
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install Bazelisk
         run: |
-          Write-Host "GitHub Actions is working."
-          Write-Host "Repository: $env:GITHUB_REPOSITORY"
-          Write-Host "Branch/ref: $env:GITHUB_REF"
-          Write-Host "Commit: $env:GITHUB_SHA"
+          if (-not (Get-Command bazelisk -ErrorAction SilentlyContinue)) {
+            winget install --id=Bazel.Bazelisk -e --accept-source-agreements --accept-package-agreements --disable-interactivity
+          }
+
+          $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+          $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+          $env:Path = "$machinePath;$userPath;$env:Path"
+
+          bazelisk --version
+
+      - name: Enable long paths
+        run: |
+          git config --global core.longpaths true
+
+          try {
+            New-ItemProperty `
+              -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" `
+              -Name "LongPathsEnabled" `
+              -Value 1 `
+              -PropertyType DWORD `
+              -Force | Out-Null
+          } catch {
+            Write-Warning "Could not enable HKLM long paths. Continuing."
+          }
+
+      - name: Clone LiteRT-LM
+        run: |
+          git clone --depth 1 --branch "$env:UPSTREAM_TAG" https://github.com/google-ai-edge/LiteRT-LM.git upstream
+
+          git -C upstream lfs install
+          git -C upstream lfs pull
+
+          $commit = git -C upstream rev-parse HEAD
+          "UPSTREAM_COMMIT=$commit" >> $env:GITHUB_ENV
+
+          Write-Host "LiteRT-LM tag: $env:UPSTREAM_TAG"
+          Write-Host "LiteRT-LM commit: $commit"
+
+      - name: Patch Android NDK registration out of WORKSPACE
+        working-directory: upstream
+        run: |
+          # GitHub Windows images contain Android SDK/NDK directories.
+          # LiteRT-LM v0.10.2 registers Android NDK toolchains in WORKSPACE.
+          # For this Windows CPU-only release, we do not need Android.
+          # This patch prevents Bazel from fetching @androidndk and failing on Windows symlinks.
+
+          Remove-Item Env:ANDROID_NDK_HOME -ErrorAction SilentlyContinue
+          Remove-Item Env:ANDROID_NDK_ROOT -ErrorAction SilentlyContinue
+          Remove-Item Env:ANDROID_HOME -ErrorAction SilentlyContinue
+          Remove-Item Env:ANDROID_SDK_ROOT -ErrorAction SilentlyContinue
+          Remove-Item Env:ANDROID_SDK_HOME -ErrorAction SilentlyContinue
+
+          $workspace = "WORKSPACE"
+          $content = Get-Content $workspace -Raw
+
+          $old = 'register_toolchains("@androidndk//:all" if ANDROID_NDK_HOME_IS_SET else "@android_ndk_env//:all")'
+          $new = 'register_toolchains("@android_ndk_env//:all")'
+
+          if ($content.Contains($old)) {
+            $content = $content.Replace($old, $new)
+            Set-Content $workspace $content -Encoding UTF8
+            Write-Host "Patched Android NDK toolchain registration."
+          } else {
+            Write-Warning "Exact Android toolchain line was not found. Trying regex fallback."
+
+            $pattern = 'register_toolchains\("@androidndk//:all"\s+if\s+ANDROID_NDK_HOME_IS_SET\s+else\s+"@android_ndk_env//:all"\)'
+            $patched = [regex]::Replace($content, $pattern, $new)
+
+            if ($patched -eq $content) {
+              Write-Host "Android-related WORKSPACE lines:"
+              Select-String -Path $workspace -Pattern "androidndk|android_ndk_env|ANDROID_NDK_HOME|register_toolchains" -Context 2,2
+              throw "Could not patch Android NDK toolchain registration."
+            }
+
+            Set-Content $workspace $patched -Encoding UTF8
+            Write-Host "Patched Android NDK toolchain registration with regex fallback."
+          }
+
+          Write-Host "Final Android-related WORKSPACE lines:"
+          Select-String -Path $workspace -Pattern "androidndk|android_ndk_env|ANDROID_NDK_HOME|register_toolchains" -Context 1,1
+
+      - name: Build Windows CPU executable
+        working-directory: upstream
+        run: |
+          $shortSha = "${{ github.sha }}".Substring(0, 8)
+          $outputBase = "D:/bzl-$shortSha"
+          Write-Host "Bazel output base: $outputBase"
+
+          bazelisk --output_base="$outputBase" shutdown
+
+          bazelisk --output_base="$outputBase" `
+            build `
+            --build_tag_filters='-nowindows' `
+            //runtime/engine:litert_lm_main
+
+      - name: Package runtime
+        run: |
+          $dist = "dist"
+          New-Item -ItemType Directory -Force $dist | Out-Null
+
+          $exeSource = "upstream\bazel-bin\runtime\engine\litert_lm_main.exe"
+          if (-not (Test-Path $exeSource)) {
+            throw "Expected executable not found: $exeSource"
+          }
+
+          Copy-Item $exeSource "$dist\litert-lm-cpu-windows-x64.exe" -Force
+          Copy-Item "upstream\LICENSE" "$dist\LICENSE-LiteRT-LM.txt" -Force
+
+          if (Test-Path "upstream\NOTICE") {
+            Copy-Item "upstream\NOTICE" "$dist\NOTICE-LiteRT-LM.txt" -Force
+          }
+
+          @"
+LiteRT-LM Windows CPU Runtime
+
+Upstream repo: https://github.com/google-ai-edge/LiteRT-LM
+Upstream tag: $env:UPSTREAM_TAG
+Upstream commit: $env:UPSTREAM_COMMIT
+
+This is an unofficial CPU-only native Windows x64 runtime build.
+GPU files are intentionally not included.
+
+Usage:
+  .\litert-lm-cpu-windows-x64.exe --backend=cpu --model_path=C:\path\to\model.litertlm
+
+Notes:
+  - Models are not included.
+  - No LiteRT GPU accelerator DLLs are included.
+  - No DirectXShaderCompiler DLLs are included.
+  - The EXE may still depend on normal Windows/MSVC runtime DLLs.
+"@ | Set-Content "$dist\README.txt" -Encoding UTF8
+
+          @"
+Source:
+- Repository: https://github.com/google-ai-edge/LiteRT-LM
+- Tag: $env:UPSTREAM_TAG
+- Commit: $env:UPSTREAM_COMMIT
+
+Build:
+- Target: //runtime/engine:litert_lm_main
+- Bazel filter: --build_tag_filters='-nowindows'
+- Android NDK toolchain registration patched out for Windows CPU-only release.
+"@ | Set-Content "$dist\SOURCE.txt" -Encoding UTF8
+
+      - name: Inspect dependencies
+        run: |
+          $exe = "dist\litert-lm-cpu-windows-x64.exe"
+          $depsFile = "dist\DEPENDENCIES.txt"
+
+          $dumpbin = Get-ChildItem "${env:ProgramFiles}\Microsoft Visual Studio\2022" `
+            -Recurse `
+            -Filter dumpbin.exe `
+            -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match "Hostx64\\x64" } |
+            Select-Object -First 1 -ExpandProperty FullName
+
+          if (-not $dumpbin) {
+            "dumpbin.exe not found; dependency inspection skipped." | Set-Content $depsFile -Encoding UTF8
+            Write-Warning "dumpbin.exe not found. Skipping dependency inspection."
+            exit 0
+          }
+
+          & $dumpbin /DEPENDENTS $exe | Tee-Object -FilePath $depsFile
+
+          $content = Get-Content $depsFile -Raw
+
+          $bad = @(
+            "libLiteRt.dll",
+            "libLiteRtWebGpuAccelerator.dll",
+            "libLiteRtGpuAccelerator.dll",
+            "dxcompiler.dll",
+            "dxil.dll"
+          )
+
+          $found = @()
+          foreach ($name in $bad) {
+            if ($content -match [regex]::Escape($name)) {
+              $found += $name
+            }
+          }
+
+          if ($found.Count -gt 0) {
+            throw "Unexpected GPU or sidecar dependency found: $($found -join ', ')"
+          }
+
+          Write-Host "No known GPU sidecar dependency found."
+
+      - name: Create zip
+        id: zip
+        run: |
+          $zip = "litert-lm-cpu-windows-x64-$env:UPSTREAM_TAG.zip"
+
+          if (Test-Path $zip) {
+            Remove-Item $zip -Force
+          }
+
+          Compress-Archive -Path "dist\*" -DestinationPath $zip -Force
+
+          "zip=$zip" >> $env:GITHUB_OUTPUT
+          Write-Host "Created $zip"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: litert-lm-cpu-windows-x64
+          path: ${{ steps.zip.outputs.zip }}
+
+      - name: Publish GitHub release
+        run: |
+          $releaseTag = "litert-lm-cpu-windows-x64-$env:UPSTREAM_TAG"
+
+          $notes = @"
+Unofficial LiteRT-LM native Windows x64 CPU runtime.
+
+Upstream:
+- Repo: google-ai-edge/LiteRT-LM
+- Tag: $env:UPSTREAM_TAG
+- Commit: $env:UPSTREAM_COMMIT
+
+Package:
+- litert-lm-cpu-windows-x64.exe
+- LICENSE-LiteRT-LM.txt
+- README.txt
+- SOURCE.txt
+- DEPENDENCIES.txt
+
+This Release 1 package intentionally excludes GPU accelerator DLLs and DirectXShaderCompiler DLLs.
+"@
+
+          $notesPath = "release-notes.md"
+          $notes | Set-Content $notesPath -Encoding UTF8
+
+          $zip = "${{ steps.zip.outputs.zip }}"
+
+          gh release view $releaseTag *> $null
+
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $releaseTag $zip --clobber
+          } else {
+            gh release create $releaseTag $zip `
+              --title "LiteRT-LM Windows x64 CPU runtime $env:UPSTREAM_TAG" `
+              --notes-file $notesPath
+          }
