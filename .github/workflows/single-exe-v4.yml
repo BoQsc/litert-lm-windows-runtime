@@ -1,0 +1,376 @@
+name: Build LiteRT-LM Windows Single EXE V4
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "LiteRT-LM tag to build"
+        required: true
+        default: "v0.10.2"
+      bazel_jobs:
+        description: "Bazel jobs. Use 2 if Rust/MSVC linking is flaky; use 4 if stable."
+        required: true
+        default: "2"
+      publish_release:
+        description: "Publish GitHub Release"
+        type: boolean
+        required: true
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: litert-lm-single-exe-v4
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build V4 single EXE
+    runs-on: windows-latest
+
+    defaults:
+      run:
+        shell: pwsh
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ANDROID_NDK_HOME: ""
+      ANDROID_NDK_ROOT: ""
+
+    steps:
+      - name: WORKFLOW VERSION CHECK
+        run: |
+          Write-Host "WORKFLOW_VERSION=single-exe-v4"
+          Write-Host "Manual-only workflow. It does not run on every commit."
+
+      - name: Checkout release repo
+        uses: actions/checkout@v4
+
+      - name: Prepare short Windows paths
+        run: |
+          New-Item -ItemType Directory -Force D:\s | Out-Null
+          New-Item -ItemType Directory -Force D:\b | Out-Null
+          New-Item -ItemType Directory -Force D:\t | Out-Null
+
+          "SRC_DIR=D:\s" >> $env:GITHUB_ENV
+          "BAZEL_OUTPUT_BASE=D:\b" >> $env:GITHUB_ENV
+          "TEMP=D:\t" >> $env:GITHUB_ENV
+          "TMP=D:\t" >> $env:GITHUB_ENV
+
+          $env:TEMP = "D:\t"
+          $env:TMP = "D:\t"
+
+          Write-Host "SRC_DIR=D:\s"
+          Write-Host "BAZEL_OUTPUT_BASE=D:\b"
+          Write-Host "TEMP=$env:TEMP"
+          Write-Host "TMP=$env:TMP"
+
+      - name: Set build variables
+        run: |
+          $tag = "${{ inputs.upstream_tag }}".Trim()
+          if (-not $tag) {
+            $tag = "v0.10.2"
+          }
+
+          $jobsText = "${{ inputs.bazel_jobs }}".Trim()
+          $jobs = 2
+          if ([int]::TryParse($jobsText, [ref]$jobs)) {
+            if ($jobs -lt 1) { $jobs = 1 }
+            if ($jobs -gt 8) { $jobs = 8 }
+          } else {
+            $jobs = 2
+          }
+
+          "UPSTREAM_TAG=$tag" >> $env:GITHUB_ENV
+          "BAZEL_JOBS=$jobs" >> $env:GITHUB_ENV
+
+          Write-Host "UPSTREAM_TAG=$tag"
+          Write-Host "BAZEL_JOBS=$jobs"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install Bazelisk
+        run: |
+          if (-not (Get-Command bazelisk -ErrorAction SilentlyContinue)) {
+            winget install --id=Bazel.Bazelisk -e --accept-source-agreements --accept-package-agreements --disable-interactivity
+          }
+
+          $env:Path = "$([Environment]::GetEnvironmentVariable('Path','Machine'));$([Environment]::GetEnvironmentVariable('Path','User'));$env:Path"
+          bazelisk --version
+
+      - name: Enable long paths
+        run: |
+          git config --global core.longpaths true
+          try {
+            New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force | Out-Null
+          } catch {
+            Write-Warning "Could not enable HKLM long paths. Continuing."
+          }
+
+      - name: Clone LiteRT-LM into short path
+        run: |
+          $env:TEMP = "D:\t"
+          $env:TMP = "D:\t"
+
+          if (Test-Path "D:\s\LiteRT-LM") {
+            Remove-Item "D:\s\LiteRT-LM" -Recurse -Force
+          }
+
+          git clone --depth 1 --branch "$env:UPSTREAM_TAG" https://github.com/google-ai-edge/LiteRT-LM.git "D:\s\LiteRT-LM"
+          git -C "D:\s\LiteRT-LM" lfs install
+          git -C "D:\s\LiteRT-LM" lfs pull
+
+          $commit = git -C "D:\s\LiteRT-LM" rev-parse HEAD
+          "UPSTREAM_COMMIT=$commit" >> $env:GITHUB_ENV
+
+          Write-Host "UPSTREAM_COMMIT=$commit"
+
+      - name: Patch Android NDK registration out of WORKSPACE
+        working-directory: D:\s\LiteRT-LM
+        run: |
+          $env:TEMP = "D:\t"
+          $env:TMP = "D:\t"
+
+          Remove-Item Env:ANDROID_NDK_HOME -ErrorAction SilentlyContinue
+          Remove-Item Env:ANDROID_NDK_ROOT -ErrorAction SilentlyContinue
+
+          $workspace = "WORKSPACE"
+          $content = Get-Content $workspace -Raw
+
+          $old = 'register_toolchains("@androidndk//:all" if ANDROID_NDK_HOME_IS_SET else "@android_ndk_env//:all")'
+          $new = 'register_toolchains("@android_ndk_env//:all")'
+
+          if ($content.Contains($old)) {
+            $content = $content.Replace($old, $new)
+            Set-Content $workspace $content -Encoding UTF8
+            Write-Host "Patched Android NDK toolchain registration."
+          } else {
+            $pattern = 'register_toolchains\("@androidndk//:all"\s+if\s+ANDROID_NDK_HOME_IS_SET\s+else\s+"@android_ndk_env//:all"\)'
+            $patched = [regex]::Replace($content, $pattern, $new)
+            if ($patched -eq $content) {
+              Select-String -Path $workspace -Pattern "androidndk|android_ndk_env|ANDROID_NDK_HOME|register_toolchains" -Context 2,2
+              throw "Could not patch Android NDK toolchain registration."
+            }
+            Set-Content $workspace $patched -Encoding UTF8
+            Write-Host "Patched Android NDK toolchain registration with regex fallback."
+          }
+
+      - name: Build single EXE with FST constraints disabled
+        working-directory: D:\s\LiteRT-LM
+        run: |
+          $env:TEMP = "D:\t"
+          $env:TMP = "D:\t"
+
+          Write-Host "WORKFLOW_VERSION=single-exe-v4"
+          Write-Host "PWD=$(Get-Location)"
+          Write-Host "TEMP=$env:TEMP"
+          Write-Host "TMP=$env:TMP"
+          Write-Host "BAZEL_OUTPUT_BASE=D:\b"
+          Write-Host "BAZEL_JOBS=$env:BAZEL_JOBS"
+
+          bazelisk --output_base="D:\b" shutdown
+
+          bazelisk --output_base="D:\b" `
+            build `
+            --build_tag_filters='-nowindows' `
+            --define=LITERT_LM_FST_CONSTRAINTS_DISABLED=1 `
+            --action_env=TEMP=D:\t `
+            --action_env=TMP=D:\t `
+            --jobs="$env:BAZEL_JOBS" `
+            //runtime/engine:litert_lm_main
+
+      - name: Package single EXE
+        run: |
+          $dist = "$env:GITHUB_WORKSPACE\dist"
+          if (Test-Path $dist) {
+            Remove-Item $dist -Recurse -Force
+          }
+
+          New-Item -ItemType Directory -Force $dist | Out-Null
+
+          $exeSource = "D:\s\LiteRT-LM\bazel-bin\runtime\engine\litert_lm_main.exe"
+          if (-not (Test-Path $exeSource)) {
+            throw "Expected executable not found: $exeSource"
+          }
+
+          Copy-Item $exeSource "$dist\litert-lm-single-windows-x64.exe" -Force
+          Copy-Item "D:\s\LiteRT-LM\LICENSE" "$dist\LICENSE-LiteRT-LM.txt" -Force
+
+          if (Test-Path "D:\s\LiteRT-LM\NOTICE") {
+            Copy-Item "D:\s\LiteRT-LM\NOTICE" "$dist\NOTICE-LiteRT-LM.txt" -Force
+          }
+
+          $version = @(
+            "workflow=single-exe-v4",
+            "upstream_tag=$env:UPSTREAM_TAG",
+            "upstream_commit=$env:UPSTREAM_COMMIT",
+            "bazel_jobs=$env:BAZEL_JOBS",
+            "fst_constraints_disabled=1"
+          )
+          $version | Set-Content "$dist\VERSION.txt" -Encoding UTF8
+
+          $readme = @(
+            "LiteRT-LM Windows Single EXE",
+            "",
+            "Workflow version: single-exe-v4",
+            "Upstream repo: https://github.com/google-ai-edge/LiteRT-LM",
+            "Upstream tag: $env:UPSTREAM_TAG",
+            "Upstream commit: $env:UPSTREAM_COMMIT",
+            "",
+            "Usage:",
+            "  .\litert-lm-single-windows-x64.exe --backend=cpu --model_path=C:\path\to\model.litertlm --input_prompt=""Hello.""",
+            "",
+            "Important:",
+            "  - Built with --define=LITERT_LM_FST_CONSTRAINTS_DISABLED=1.",
+            "  - This removes the GemmaModelConstraintProvider sidecar DLL dependency.",
+            "  - FST constrained decoding / constrained tool-call decoding is disabled.",
+            "  - Models are not included.",
+            "  - The EXE may still depend on normal Windows/MSVC runtime DLLs."
+          )
+          $readme | Set-Content "$dist\README.txt" -Encoding UTF8
+
+          $sample = @(
+            "@echo off",
+            "cd /d ""%~dp0""",
+            "if ""%~1""=="""" (",
+            "  echo Usage: run-example.cmd C:\path\to\model.litertlm",
+            "  pause",
+            "  exit /b 1",
+            ")",
+            "litert-lm-single-windows-x64.exe --backend=cpu --model_path=""%~1"" --input_prompt=""Hello. Write one short paragraph.""",
+            "pause"
+          )
+          $sample | Set-Content "$dist\run-example.cmd" -Encoding ASCII
+
+          $source = @(
+            "Source:",
+            "- Repository: https://github.com/google-ai-edge/LiteRT-LM",
+            "- Tag: $env:UPSTREAM_TAG",
+            "- Commit: $env:UPSTREAM_COMMIT",
+            "",
+            "Build:",
+            "- Workflow version: single-exe-v4",
+            "- Target: //runtime/engine:litert_lm_main",
+            "- Bazel filter: --build_tag_filters='-nowindows'",
+            "- Single-EXE flag: --define=LITERT_LM_FST_CONSTRAINTS_DISABLED=1",
+            "- Short source path: D:\s\LiteRT-LM",
+            "- Short Bazel output base: D:\b",
+            "- Short temp path: D:\t",
+            "- Bazel action_env TEMP/TMP forced to D:\t",
+            "- Jobs: $env:BAZEL_JOBS"
+          )
+          $source | Set-Content "$dist\SOURCE.txt" -Encoding UTF8
+
+      - name: Verify no LiteRT-LM sidecar DLL dependency
+        run: |
+          $exe = "$env:GITHUB_WORKSPACE\dist\litert-lm-single-windows-x64.exe"
+          $depsFile = "$env:GITHUB_WORKSPACE\dist\DEPENDENCIES.txt"
+
+          $dumpbin = Get-ChildItem "${env:ProgramFiles}\Microsoft Visual Studio\2022" -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match "Hostx64\\x64" } |
+            Select-Object -First 1 -ExpandProperty FullName
+
+          if (-not $dumpbin) {
+            "dumpbin.exe not found; dependency inspection skipped." | Set-Content $depsFile -Encoding UTF8
+            Write-Warning "dumpbin.exe not found. Cannot prove sidecar dependency status."
+            exit 0
+          }
+
+          & $dumpbin /DEPENDENTS $exe | Tee-Object -FilePath $depsFile
+
+          $content = Get-Content $depsFile -Raw
+
+          $forbidden = @(
+            "libGemmaModelConstraintProvider.dll",
+            "libLiteRt.dll",
+            "libLiteRtWebGpuAccelerator.dll",
+            "libLiteRtGpuAccelerator.dll",
+            "libLiteRtTopKWebGpuSampler.dll",
+            "dxcompiler.dll",
+            "dxil.dll"
+          )
+
+          $found = @()
+          foreach ($name in $forbidden) {
+            if ($content -match [regex]::Escape($name)) {
+              $found += $name
+            }
+          }
+
+          if ($found.Count -gt 0) {
+            throw "Not a single LiteRT-LM EXE yet. Found sidecar DLL dependency: $($found -join ', ')"
+          }
+
+          Write-Host "No known LiteRT-LM sidecar DLL dependencies found."
+
+      - name: Generate SHA256 checksums
+        run: |
+          $dist = "$env:GITHUB_WORKSPACE\dist"
+          Get-ChildItem $dist -File | ForEach-Object {
+            $hash = Get-FileHash $_.FullName -Algorithm SHA256
+            "$($hash.Hash)  $($_.Name)"
+          } | Set-Content "$dist\SHA256SUMS.txt" -Encoding ASCII
+
+          Get-Content "$dist\SHA256SUMS.txt"
+
+      - name: Create zip
+        id: zip
+        run: |
+          $zip = "$env:GITHUB_WORKSPACE\litert-lm-single-windows-x64-$env:UPSTREAM_TAG-v4.zip"
+          if (Test-Path $zip) {
+            Remove-Item $zip -Force
+          }
+
+          Compress-Archive -Path "$env:GITHUB_WORKSPACE\dist\*" -DestinationPath $zip -Force
+          "zip=$zip" >> $env:GITHUB_OUTPUT
+          Write-Host "Created $zip"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: litert-lm-single-windows-x64-v4
+          path: ${{ steps.zip.outputs.zip }}
+
+      - name: Publish GitHub release
+        if: ${{ inputs.publish_release }}
+        run: |
+          $releaseTag = "litert-lm-single-windows-x64-$env:UPSTREAM_TAG-v4"
+
+          $notes = @(
+            "Unofficial LiteRT-LM native Windows x64 single-EXE build.",
+            "",
+            "Workflow version: single-exe-v4",
+            "Manual-only workflow; it does not run on push.",
+            "",
+            "Built with --define=LITERT_LM_FST_CONSTRAINTS_DISABLED=1 to remove the GemmaModelConstraintProvider DLL dependency.",
+            "This disables FST constrained decoding / constrained tool-call decoding.",
+            "",
+            "Package includes SHA256SUMS.txt and run-example.cmd.",
+            "",
+            "Upstream:",
+            "- Repo: google-ai-edge/LiteRT-LM",
+            "- Tag: $env:UPSTREAM_TAG",
+            "- Commit: $env:UPSTREAM_COMMIT"
+          )
+
+          $notesPath = "$env:GITHUB_WORKSPACE\release-notes.md"
+          $notes | Set-Content $notesPath -Encoding UTF8
+
+          $zip = "${{ steps.zip.outputs.zip }}"
+
+          gh release view $releaseTag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $releaseTag $zip --clobber
+          } else {
+            gh release create $releaseTag $zip --title "LiteRT-LM Windows x64 single EXE $env:UPSTREAM_TAG V4" --notes-file $notesPath
+          }
