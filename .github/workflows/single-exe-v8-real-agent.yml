@@ -1,0 +1,737 @@
+name: Build LiteRT-LM Windows Single EXE V8 Real Agent
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "LiteRT-LM tag to build, e.g. v0.10.2 or latest"
+        required: true
+        default: "latest"
+      bazel_jobs:
+        description: "Bazel jobs. Use 2 for safer Windows/Rust builds."
+        required: true
+        default: "2"
+      publish_release:
+        description: "Publish GitHub Release with one .exe asset"
+        type: boolean
+        required: true
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: litert-v8-single-exe-real-agent
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build V8 true single-EXE agent
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    defaults:
+      run:
+        shell: pwsh
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ANDROID_NDK_HOME: ""
+      ANDROID_NDK_ROOT: ""
+      FINAL_EXE_NAME: litert-gemma-agent-windows-x64.exe
+
+    steps:
+      - name: Checkout release repo
+        uses: actions/checkout@v4
+
+      - name: Prepare short Windows paths
+        run: |
+          New-Item -ItemType Directory -Force D:\s | Out-Null
+          New-Item -ItemType Directory -Force D:\b | Out-Null
+          New-Item -ItemType Directory -Force D:\t | Out-Null
+          "TEMP=D:\t" >> $env:GITHUB_ENV
+          "TMP=D:\t" >> $env:GITHUB_ENV
+
+      - name: Resolve variables
+        run: |
+          $tag = "${{ inputs.upstream_tag }}".Trim()
+          if (-not $tag) { $tag = "latest" }
+          if ($tag -eq "latest") {
+            $tag = gh release view --repo google-ai-edge/LiteRT-LM --json tagName --jq ".tagName"
+            if (-not $tag) { throw "Could not resolve latest LiteRT-LM release tag." }
+          }
+
+          $jobs = 2
+          [void][int]::TryParse("${{ inputs.bazel_jobs }}", [ref]$jobs)
+          if ($jobs -lt 1) { $jobs = 1 }
+          if ($jobs -gt 8) { $jobs = 8 }
+
+          $safe = $tag -replace '[^A-Za-z0-9._-]', '_'
+          "UPSTREAM_TAG=$tag" >> $env:GITHUB_ENV
+          "SAFE_UPSTREAM_TAG=$safe" >> $env:GITHUB_ENV
+          "BAZEL_JOBS=$jobs" >> $env:GITHUB_ENV
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Set up .NET for single-file launcher
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Install Bazelisk
+        run: |
+          if (-not (Get-Command bazelisk -ErrorAction SilentlyContinue)) {
+            winget install --id=Bazel.Bazelisk -e --accept-source-agreements --accept-package-agreements --disable-interactivity
+          }
+          $env:Path = "$([Environment]::GetEnvironmentVariable('Path','Machine'));$([Environment]::GetEnvironmentVariable('Path','User'));$env:Path"
+          bazelisk --version
+
+      - name: Enable long paths
+        run: |
+          git config --global core.longpaths true
+          try {
+            New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force | Out-Null
+          } catch {
+            Write-Warning "Could not enable HKLM long paths; short D:\ paths are still used."
+          }
+
+      - name: Clone LiteRT-LM
+        run: |
+          $env:TEMP = "D:\t"
+          $env:TMP = "D:\t"
+          if (Test-Path "D:\s\LiteRT-LM") { Remove-Item "D:\s\LiteRT-LM" -Recurse -Force }
+          git clone --depth 1 --branch "$env:UPSTREAM_TAG" https://github.com/google-ai-edge/LiteRT-LM.git "D:\s\LiteRT-LM"
+          git -C "D:\s\LiteRT-LM" lfs install
+          git -C "D:\s\LiteRT-LM" lfs pull
+          $commit = git -C "D:\s\LiteRT-LM" rev-parse HEAD
+          "UPSTREAM_COMMIT=$commit" >> $env:GITHUB_ENV
+
+      - name: Patch Android NDK registration out of WORKSPACE
+        working-directory: D:\s\LiteRT-LM
+        run: |
+          Remove-Item Env:ANDROID_NDK_HOME -ErrorAction SilentlyContinue
+          Remove-Item Env:ANDROID_NDK_ROOT -ErrorAction SilentlyContinue
+          $workspace = "WORKSPACE"
+          $content = Get-Content $workspace -Raw
+          $old = 'register_toolchains("@androidndk//:all" if ANDROID_NDK_HOME_IS_SET else "@android_ndk_env//:all")'
+          $new = 'register_toolchains("@android_ndk_env//:all")'
+          if ($content.Contains($old)) {
+            $content = $content.Replace($old, $new)
+            Set-Content $workspace $content -Encoding UTF8
+          } else {
+            $pattern = 'register_toolchains\("@androidndk//:all"\s+if\s+ANDROID_NDK_HOME_IS_SET\s+else\s+"@android_ndk_env//:all"\)'
+            $patched = [regex]::Replace($content, $pattern, $new)
+            if ($patched -eq $content) { throw "Could not patch Android NDK toolchain registration." }
+            Set-Content $workspace $patched -Encoding UTF8
+          }
+
+      - name: Build embedded LiteRT-LM runner
+        working-directory: D:\s\LiteRT-LM
+        run: |
+          $env:TEMP = "D:\t"
+          $env:TMP = "D:\t"
+          bazelisk --output_base="D:\b" shutdown
+          bazelisk --output_base="D:\b" `
+            build `
+            --build_tag_filters='-nowindows' `
+            --define=LITERT_LM_FST_CONSTRAINTS_DISABLED=1 `
+            --action_env=TEMP=D:\t `
+            --action_env=TMP=D:\t `
+            --jobs="$env:BAZEL_JOBS" `
+            //runtime/engine:litert_lm_main
+
+      - name: Generate single-EXE agent launcher source
+        run: |
+          $agent = "$env:GITHUB_WORKSPACE\agent"
+          if (Test-Path $agent) { Remove-Item $agent -Recurse -Force }
+          New-Item -ItemType Directory -Force $agent | Out-Null
+
+          $runner = "D:\s\LiteRT-LM\bazel-bin\runtime\engine\litert_lm_main.exe"
+          if (-not (Test-Path $runner)) { throw "Expected LiteRT-LM runner not found: $runner" }
+          Copy-Item $runner "$agent\litert-lm-runner.exe" -Force
+
+          @'
+          <Project Sdk="Microsoft.NET.Sdk">
+            <PropertyGroup>
+              <OutputType>Exe</OutputType>
+              <TargetFramework>net8.0</TargetFramework>
+              <ImplicitUsings>enable</ImplicitUsings>
+              <Nullable>enable</Nullable>
+              <AssemblyName>litert-gemma-agent-windows-x64</AssemblyName>
+              <RootNamespace>LiteRTGemmaAgent</RootNamespace>
+              <InvariantGlobalization>true</InvariantGlobalization>
+              <DebugType>none</DebugType>
+              <DebugSymbols>false</DebugSymbols>
+            </PropertyGroup>
+            <ItemGroup>
+              <EmbeddedResource Include="litert-lm-runner.exe" LogicalName="litert-lm-runner.exe" />
+            </ItemGroup>
+          </Project>
+          '@ | Set-Content "$agent\LiteRTGemmaAgent.csproj" -Encoding UTF8
+
+          @'
+          using System.Diagnostics;
+          using System.Reflection;
+          using System.Security.Cryptography;
+          using System.Text;
+          using System.Text.Json;
+          
+          static class Program
+          {
+              const string AppName = "LiteRT Gemma Single-EXE Agent";
+              const string RunnerResource = "litert-lm-runner.exe";
+          
+              static int Main(string[] args)
+              {
+                  try
+                  {
+            if (args.Length == 0 || Is(args[0], "help") || Is(args[0], "--help") || Is(args[0], "-h"))
+            {
+                PrintHelp();
+                return 0;
+            }
+          
+            string command = args[0].Trim().ToLowerInvariant();
+            string[] rest = args.Skip(1).ToArray();
+          
+            // Compatibility mode: allow direct LiteRT-LM flags without a subcommand.
+            if (args.Any(a => a.StartsWith("--model_path", StringComparison.OrdinalIgnoreCase) ||
+                              a.StartsWith("--input_prompt", StringComparison.OrdinalIgnoreCase) ||
+                              a.StartsWith("--input_prompt_file", StringComparison.OrdinalIgnoreCase)))
+            {
+                return RunLiteRt(args, stream: true);
+            }
+          
+            return command switch
+            {
+                "run" => RunCommand(rest),
+                "file" => FileCommand(rest),
+                "chat" => ChatCommand(rest),
+                "agent" => AgentCommand(rest),
+                "raw" => RawCommand(rest),
+                "self-test" => SelfTest(),
+                "version" => VersionCommand(),
+                _ => Unknown(command)
+            };
+                  }
+                  catch (Exception ex)
+                  {
+            Console.Error.WriteLine("ERROR: " + ex.Message);
+            return 1;
+                  }
+              }
+          
+              static int Unknown(string command)
+              {
+                  Console.Error.WriteLine($"Unknown command: {command}");
+                  Console.Error.WriteLine();
+                  PrintHelp();
+                  return 2;
+              }
+          
+              static bool Is(string a, string b) => string.Equals(a, b, StringComparison.OrdinalIgnoreCase);
+          
+              static int VersionCommand()
+              {
+                  Console.WriteLine(AppName);
+                  Console.WriteLine("Wrapper: v8 true-single-exe");
+                  Console.WriteLine("Embedded runner: LiteRT-LM litert_lm_main.exe");
+                  Console.WriteLine("Models included: no");
+                  Console.WriteLine("Use a compatible .litertlm model, for example a Gemma 4 LiteRT-LM model file.");
+                  return 0;
+              }
+          
+              static void PrintHelp()
+              {
+                  Console.WriteLine(AppName);
+                  Console.WriteLine();
+                  Console.WriteLine("One visible Windows EXE. The LiteRT-LM runner is embedded inside this launcher.");
+                  Console.WriteLine("Models are not embedded; pass a compatible .litertlm model path.");
+                  Console.WriteLine();
+                  Console.WriteLine("Commands:");
+                  Console.WriteLine("  run    --model MODEL.litertlm --prompt \"Hello\" [--backend cpu]");
+                  Console.WriteLine("  file   --model MODEL.litertlm --prompt-file prompt.txt [--backend cpu]");
+                  Console.WriteLine("  chat   --model MODEL.litertlm [--system system.txt] [--backend cpu]");
+                  Console.WriteLine("  agent  --model MODEL.litertlm --task \"inspect this folder\" [--workspace .] [--allow-write] [--allow-shell] [--yes]");
+                  Console.WriteLine("  raw    -- --backend=cpu --model_path=MODEL.litertlm --input_prompt=\"Hello\"");
+                  Console.WriteLine("  version");
+                  Console.WriteLine("  self-test");
+                  Console.WriteLine();
+                  Console.WriteLine("Examples:");
+                  Console.WriteLine("  litert-gemma-agent-windows-x64.exe run --model C:\\models\\gemma-4-E2B-it.litertlm --prompt \"Write a haiku.\"");
+                  Console.WriteLine("  litert-gemma-agent-windows-x64.exe chat --model C:\\models\\gemma-4-E2B-it.litertlm");
+                  Console.WriteLine("  litert-gemma-agent-windows-x64.exe agent --model C:\\models\\gemma-4-E2B-it.litertlm --workspace . --task \"summarize files\"");
+                  Console.WriteLine();
+                  Console.WriteLine("Safety defaults:");
+                  Console.WriteLine("  agent mode can list/read files by default inside --workspace.");
+                  Console.WriteLine("  writing files requires --allow-write.");
+                  Console.WriteLine("  shell commands require --allow-shell and confirmation unless --yes is also set.");
+              }
+          
+              static int RunCommand(string[] args)
+              {
+                  var opt = Parse(args);
+                  string model = Required(opt, "model", "model_path");
+                  string prompt = Required(opt, "prompt", "input_prompt");
+                  string backend = Get(opt, "backend") ?? "cpu";
+                  return RunLiteRt(new[] { "--backend=" + backend, "--model_path=" + model, "--input_prompt=" + prompt }, stream: true);
+              }
+          
+              static int FileCommand(string[] args)
+              {
+                  var opt = Parse(args);
+                  string model = Required(opt, "model", "model_path");
+                  string promptFile = Required(opt, "prompt-file", "input_prompt_file");
+                  string backend = Get(opt, "backend") ?? "cpu";
+                  return RunLiteRt(new[] { "--backend=" + backend, "--model_path=" + model, "--input_prompt_file=" + promptFile }, stream: true);
+              }
+          
+              static int RawCommand(string[] args)
+              {
+                  if (args.Length > 0 && args[0] == "--") args = args.Skip(1).ToArray();
+                  return RunLiteRt(args, stream: true);
+              }
+          
+              static int ChatCommand(string[] args)
+              {
+                  var opt = Parse(args);
+                  string model = Required(opt, "model", "model_path");
+                  string backend = Get(opt, "backend") ?? "cpu";
+                  string system = "You are a helpful local assistant. Be practical, concise, and honest about limitations.";
+                  string? systemFile = Get(opt, "system");
+                  if (!string.IsNullOrWhiteSpace(systemFile)) system = File.ReadAllText(systemFile);
+          
+                  var turns = new List<(string role, string text)>();
+                  Console.WriteLine("Chat mode. Type /exit to quit, /clear to clear history.");
+                  while (true)
+                  {
+            Console.Write("You> ");
+            string? input = Console.ReadLine();
+            if (input is null) return 0;
+            if (input.Trim().Equals("/exit", StringComparison.OrdinalIgnoreCase)) return 0;
+            if (input.Trim().Equals("/clear", StringComparison.OrdinalIgnoreCase))
+            {
+                turns.Clear();
+                Console.WriteLine("History cleared.");
+                continue;
+            }
+          
+            turns.Add(("user", input));
+            string prompt = BuildChatPrompt(system, turns);
+            Console.WriteLine("Assistant>");
+            string output = CaptureLiteRt(new[] { "--backend=" + backend, "--model_path=" + model, "--input_prompt=" + prompt });
+            Console.WriteLine(output.Trim());
+            turns.Add(("assistant", output.Trim()));
+                  }
+              }
+          
+              static string BuildChatPrompt(string system, List<(string role, string text)> turns)
+              {
+                  var sb = new StringBuilder();
+                  sb.AppendLine("System:");
+                  sb.AppendLine(system.Trim());
+                  sb.AppendLine();
+                  foreach (var t in turns.TakeLast(16))
+                  {
+            sb.AppendLine(t.role == "user" ? "User:" : "Assistant:");
+            sb.AppendLine(t.text.Trim());
+            sb.AppendLine();
+                  }
+                  sb.AppendLine("Assistant:");
+                  return sb.ToString();
+              }
+          
+              static int AgentCommand(string[] args)
+              {
+                  var opt = Parse(args);
+                  string model = Required(opt, "model", "model_path");
+                  string task = Required(opt, "task", "prompt");
+                  string backend = Get(opt, "backend") ?? "cpu";
+                  string workspace = Path.GetFullPath(Get(opt, "workspace") ?? Directory.GetCurrentDirectory());
+                  bool allowWrite = Has(opt, "allow-write");
+                  bool allowShell = Has(opt, "allow-shell");
+                  bool yes = Has(opt, "yes") || Has(opt, "y");
+                  int maxSteps = int.TryParse(Get(opt, "max-steps"), out var n) ? Math.Clamp(n, 1, 20) : 8;
+          
+                  Directory.CreateDirectory(workspace);
+                  var transcript = new List<string>();
+                  transcript.Add("User task: " + task);
+                  transcript.Add("Workspace: " + workspace);
+          
+                  Console.WriteLine("Agent mode started.");
+                  Console.WriteLine("Workspace: " + workspace);
+                  Console.WriteLine("Write enabled: " + allowWrite);
+                  Console.WriteLine("Shell enabled: " + allowShell);
+                  Console.WriteLine();
+          
+                  for (int step = 1; step <= maxSteps; step++)
+                  {
+            string prompt = BuildAgentPrompt(task, workspace, transcript, allowWrite, allowShell);
+            string modelOut = CaptureLiteRt(new[] { "--backend=" + backend, "--model_path=" + model, "--input_prompt=" + prompt }).Trim();
+            Console.WriteLine($"--- model step {step} ---");
+            Console.WriteLine(modelOut);
+            Console.WriteLine();
+          
+            var action = TryParseAction(modelOut);
+            if (action is null)
+            {
+                transcript.Add("Model did not emit valid JSON action. Observation: ask again using valid JSON only.");
+                continue;
+            }
+          
+            string name = action.Value.GetProperty("action").GetString() ?? "finish";
+            if (name.Equals("finish", StringComparison.OrdinalIgnoreCase))
+            {
+                if (action.Value.TryGetProperty("answer", out var answer)) Console.WriteLine(answer.GetString());
+                return 0;
+            }
+          
+            string observation = ExecuteTool(action.Value, workspace, allowWrite, allowShell, yes);
+            Console.WriteLine("--- observation ---");
+            Console.WriteLine(observation);
+            Console.WriteLine();
+            transcript.Add("Action JSON: " + action.Value.GetRawText());
+            transcript.Add("Observation: " + observation);
+                  }
+          
+                  Console.WriteLine("Reached max steps without finish.");
+                  return 0;
+              }
+          
+              static string BuildAgentPrompt(string task, string workspace, List<string> transcript, bool allowWrite, bool allowShell)
+              {
+                  return $$"""
+          You are a local coding/file assistant running through LiteRT-LM.
+          You must respond with exactly one JSON object and no markdown.
+          
+          Task: {{task}}
+          Workspace: {{workspace}}
+          
+          Available actions:
+          {"action":"finish","answer":"final answer to the user"}
+          {"action":"list_dir","path":"relative/or/absolute/path"}
+          {"action":"read_file","path":"relative/or/absolute/path"}
+          {"action":"write_file","path":"relative/or/absolute/path","content":"text to write"}   // allowed: {{allowWrite}}
+          {"action":"shell","command":"command line to run","cwd":"relative/or/absolute/path"} // allowed: {{allowShell}}
+          
+          Rules:
+          - Prefer inspect/read before editing.
+          - Use paths inside Workspace unless the user explicitly requests otherwise.
+          - Never use shell for destructive actions unless clearly required.
+          - If you cannot complete the task with available tools, use finish and explain.
+          
+          Transcript:
+          {{string.Join("\n", transcript.TakeLast(20))}}
+          
+          Return the next JSON action now:
+          """;
+              }
+          
+              static JsonElement? TryParseAction(string text)
+              {
+                  string t = text.Trim();
+                  int start = t.IndexOf('{');
+                  int end = t.LastIndexOf('}');
+                  if (start < 0 || end <= start) return null;
+                  string json = t.Substring(start, end - start + 1);
+                  try
+                  {
+            using var doc = JsonDocument.Parse(json);
+            return doc.RootElement.Clone();
+                  }
+                  catch { return null; }
+              }
+          
+              static string ExecuteTool(JsonElement action, string workspace, bool allowWrite, bool allowShell, bool yes)
+              {
+                  string name = action.GetProperty("action").GetString() ?? "finish";
+                  string GetProp(string p, string def = "") => action.TryGetProperty(p, out var v) ? (v.GetString() ?? def) : def;
+          
+                  try
+                  {
+            if (name.Equals("list_dir", StringComparison.OrdinalIgnoreCase))
+            {
+                string path = SafePath(workspace, GetProp("path", "."));
+                var entries = Directory.EnumerateFileSystemEntries(path).Take(200).Select(p => Directory.Exists(p) ? "[dir] " + Path.GetFileName(p) : "[file] " + Path.GetFileName(p));
+                return string.Join("\n", entries);
+            }
+            if (name.Equals("read_file", StringComparison.OrdinalIgnoreCase))
+            {
+                string path = SafePath(workspace, GetProp("path"));
+                var fi = new FileInfo(path);
+                if (fi.Length > 512_000) return "File too large to read safely: " + fi.Length + " bytes";
+                return File.ReadAllText(path);
+            }
+            if (name.Equals("write_file", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!allowWrite) return "DENIED: write_file requires --allow-write";
+                string path = SafePath(workspace, GetProp("path"));
+                Directory.CreateDirectory(Path.GetDirectoryName(path) ?? workspace);
+                File.WriteAllText(path, GetProp("content"), Encoding.UTF8);
+                return "WROTE: " + path;
+            }
+            if (name.Equals("shell", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!allowShell) return "DENIED: shell requires --allow-shell";
+                string cwd = SafePath(workspace, GetProp("cwd", "."));
+                string cmd = GetProp("command");
+                if (!yes)
+                {
+                    Console.Write($"Run shell command? [{cwd}]> {cmd}\nType yes to run: ");
+                    if (!string.Equals(Console.ReadLine(), "yes", StringComparison.OrdinalIgnoreCase)) return "DENIED: user declined shell command";
+                }
+                return RunProcess("cmd.exe", "/c " + cmd, cwd, stream: false, timeoutMs: 120_000);
+            }
+            return "Unknown action: " + name;
+                  }
+                  catch (Exception ex)
+                  {
+            return "ERROR: " + ex.Message;
+                  }
+              }
+          
+              static string SafePath(string workspace, string path)
+              {
+                  if (string.IsNullOrWhiteSpace(path)) path = ".";
+                  string full = Path.GetFullPath(Path.IsPathRooted(path) ? path : Path.Combine(workspace, path));
+                  string root = Path.GetFullPath(workspace).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+                  if (!full.StartsWith(root, StringComparison.OrdinalIgnoreCase) && !string.Equals(full.TrimEnd(Path.DirectorySeparatorChar), workspace.TrimEnd(Path.DirectorySeparatorChar), StringComparison.OrdinalIgnoreCase))
+                  {
+            throw new InvalidOperationException("Path escapes workspace: " + path);
+                  }
+                  return full;
+              }
+          
+              static Dictionary<string, List<string>> Parse(string[] args)
+              {
+                  var d = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+                  for (int i = 0; i < args.Length; i++)
+                  {
+            string a = args[i];
+            if (!a.StartsWith("--")) continue;
+            a = a.Substring(2);
+            string key;
+            string val;
+            int eq = a.IndexOf('=');
+            if (eq >= 0)
+            {
+                key = a.Substring(0, eq);
+                val = a.Substring(eq + 1);
+            }
+            else
+            {
+                key = a;
+                if (i + 1 < args.Length && !args[i + 1].StartsWith("--")) val = args[++i];
+                else val = "true";
+            }
+            if (!d.TryGetValue(key, out var list)) d[key] = list = new List<string>();
+            list.Add(val);
+                  }
+                  return d;
+              }
+          
+              static string? Get(Dictionary<string, List<string>> d, string key) => d.TryGetValue(key, out var list) && list.Count > 0 ? list[^1] : null;
+              static bool Has(Dictionary<string, List<string>> d, string key) => d.ContainsKey(key);
+          
+              static string Required(Dictionary<string, List<string>> d, params string[] keys)
+              {
+                  foreach (var k in keys)
+                  {
+            var v = Get(d, k);
+            if (!string.IsNullOrWhiteSpace(v)) return v;
+                  }
+                  throw new ArgumentException("Missing required option: --" + keys[0]);
+              }
+          
+              static int RunLiteRt(string[] runnerArgs, bool stream)
+              {
+                  string runner = ExtractRunner();
+                  string argLine = string.Join(" ", runnerArgs.Select(QuoteArg));
+                  return RunProcessExitCode(runner, argLine, Directory.GetCurrentDirectory(), stream);
+              }
+          
+              static string CaptureLiteRt(string[] runnerArgs)
+              {
+                  string runner = ExtractRunner();
+                  string argLine = string.Join(" ", runnerArgs.Select(QuoteArg));
+                  return RunProcess(runner, argLine, Directory.GetCurrentDirectory(), stream: false, timeoutMs: 600_000);
+              }
+          
+              static int SelfTest()
+              {
+                  string runner = ExtractRunner();
+                  Console.WriteLine("Outer EXE OK.");
+                  Console.WriteLine("Extracted embedded LiteRT-LM runner: " + runner);
+                  string help = RunProcess(runner, "--helpfull", Directory.GetCurrentDirectory(), stream: false, timeoutMs: 60_000);
+                  if (!help.Contains("model_path") || !help.Contains("input_prompt")) throw new Exception("Embedded runner help did not expose expected LiteRT-LM flags.");
+                  Console.WriteLine("Embedded runner OK.");
+                  return 0;
+              }
+          
+              static string ExtractRunner()
+              {
+                  var asm = Assembly.GetExecutingAssembly();
+                  using Stream? s = asm.GetManifestResourceStream(RunnerResource);
+                  if (s is null) throw new FileNotFoundException("Embedded resource missing: " + RunnerResource);
+          
+                  using var sha = SHA256.Create();
+                  using var ms = new MemoryStream();
+                  s.CopyTo(ms);
+                  byte[] bytes = ms.ToArray();
+                  string hash = Convert.ToHexString(sha.ComputeHash(bytes)).Substring(0, 16).ToLowerInvariant();
+                  string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "LiteRTGemmaAgent", hash);
+                  Directory.CreateDirectory(dir);
+                  string path = Path.Combine(dir, "litert-lm-runner.exe");
+                  if (!File.Exists(path) || new FileInfo(path).Length != bytes.Length)
+                  {
+            File.WriteAllBytes(path, bytes);
+                  }
+                  return path;
+              }
+          
+              static string QuoteArg(string arg)
+              {
+                  if (arg.Length == 0) return "\"\"";
+                  if (!arg.Any(char.IsWhiteSpace) && !arg.Contains('"')) return arg;
+                  return "\"" + arg.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
+              }
+          
+              static int RunProcessExitCode(string file, string args, string cwd, bool stream)
+              {
+                  var psi = new ProcessStartInfo(file, args)
+                  {
+            WorkingDirectory = cwd,
+            UseShellExecute = false,
+            RedirectStandardOutput = !stream,
+            RedirectStandardError = !stream,
+            CreateNoWindow = false
+                  };
+                  using var p = Process.Start(psi) ?? throw new Exception("Could not start process: " + file);
+                  if (!stream)
+                  {
+            Console.Write(p.StandardOutput.ReadToEnd());
+            Console.Error.Write(p.StandardError.ReadToEnd());
+                  }
+                  p.WaitForExit();
+                  return p.ExitCode;
+              }
+          
+              static string RunProcess(string file, string args, string cwd, bool stream, int timeoutMs)
+              {
+                  var psi = new ProcessStartInfo(file, args)
+                  {
+            WorkingDirectory = cwd,
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true
+                  };
+                  using var p = Process.Start(psi) ?? throw new Exception("Could not start process: " + file);
+                  string stdout = p.StandardOutput.ReadToEnd();
+                  string stderr = p.StandardError.ReadToEnd();
+                  if (!p.WaitForExit(timeoutMs))
+                  {
+            try { p.Kill(entireProcessTree: true); } catch { }
+            throw new TimeoutException("Process timed out: " + file);
+                  }
+                  if (p.ExitCode != 0 && !string.IsNullOrWhiteSpace(stderr)) return stdout + "\n" + stderr;
+                  return stdout + (string.IsNullOrWhiteSpace(stderr) ? "" : "\n" + stderr);
+              }
+          }
+          '@ | Set-Content "$agent\Program.cs" -Encoding UTF8
+
+      - name: Publish true single EXE
+        run: |
+          $agent = "$env:GITHUB_WORKSPACE\agent"
+          $out = "$env:GITHUB_WORKSPACE\publish"
+          if (Test-Path $out) { Remove-Item $out -Recurse -Force }
+          dotnet publish "$agent\LiteRTGemmaAgent.csproj" `
+            -c Release `
+            -r win-x64 `
+            --self-contained true `
+            -o $out `
+            /p:PublishSingleFile=true `
+            /p:IncludeNativeLibrariesForSelfExtract=true `
+            /p:EnableCompressionInSingleFile=true `
+            /p:DebugType=none `
+            /p:DebugSymbols=false
+
+          $exe = Join-Path $out "$env:FINAL_EXE_NAME"
+          if (-not (Test-Path $exe)) { throw "Final single EXE not found: $exe" }
+
+          $dist = "$env:GITHUB_WORKSPACE\dist"
+          if (Test-Path $dist) { Remove-Item $dist -Recurse -Force }
+          New-Item -ItemType Directory -Force $dist | Out-Null
+          Copy-Item $exe "$dist\$env:FINAL_EXE_NAME" -Force
+
+      - name: Verify single visible artifact and embedded runner
+        run: |
+          $dist = "$env:GITHUB_WORKSPACE\dist"
+          $files = @(Get-ChildItem $dist -File)
+          if ($files.Count -ne 1) { throw "Expected exactly one output file, found $($files.Count)." }
+          if ($files[0].Name -ne $env:FINAL_EXE_NAME) { throw "Unexpected output file: $($files[0].Name)" }
+
+          $exe = "$dist\$env:FINAL_EXE_NAME"
+          & $exe self-test
+          if ($LASTEXITCODE -ne 0) { throw "Self-test failed." }
+
+          $hash = Get-FileHash $exe -Algorithm SHA256
+          "FINAL_EXE=$exe" >> $env:GITHUB_ENV
+          "FINAL_SHA256=$($hash.Hash)" >> $env:GITHUB_ENV
+          Write-Host "Single EXE: $exe"
+          Write-Host "SHA256: $($hash.Hash)"
+
+      - name: Upload single EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: litert-gemma-agent-windows-x64-exe
+          path: dist/${{ env.FINAL_EXE_NAME }}
+          if-no-files-found: error
+
+      - name: Publish release with one EXE asset
+        if: ${{ inputs.publish_release }}
+        run: |
+          $releaseTag = "litert-gemma-agent-windows-x64-v8-$env:SAFE_UPSTREAM_TAG"
+          $notes = @"
+          LiteRT-LM Windows V8 True Single-EXE Agent
+          
+          Asset policy: one release asset only: $env:FINAL_EXE_NAME
+          No ZIP packaging is created by this workflow.
+          
+          What is inside the EXE:
+          - .NET 8 self-contained single-file launcher
+          - Embedded LiteRT-LM litert_lm_main.exe runner
+          - Commands: run, file, chat, agent, raw, version, self-test
+          
+          Limits:
+          - CPU-oriented no-DLL LiteRT-LM runner
+          - Models are not embedded; pass a compatible .litertlm model path
+          - FST constrained decoding disabled to avoid LiteRT sidecar DLL dependencies
+          
+          Upstream LiteRT-LM: $env:UPSTREAM_TAG / $env:UPSTREAM_COMMIT
+          SHA256: $env:FINAL_SHA256
+          "@
+          $notesPath = "$env:GITHUB_WORKSPACE\release-notes.md"
+          $notes | Set-Content $notesPath -Encoding UTF8
+
+          $exe = "$env:GITHUB_WORKSPACE\dist\$env:FINAL_EXE_NAME"
+          gh release view $releaseTag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            $assets = gh release view $releaseTag --json assets --jq ".assets[].name"
+            foreach ($asset in $assets) {
+              gh release delete-asset $releaseTag $asset -y
+            }
+            gh release upload $releaseTag $exe --clobber
+            gh release edit $releaseTag --notes-file $notesPath
+          } else {
+            gh release create $releaseTag $exe --title "LiteRT-LM Gemma Single-EXE Agent $env:UPSTREAM_TAG" --notes-file $notesPath
+          }
